@@ -828,7 +828,7 @@ void mtl_init(void) {
     g_present_args = [g_dev newArgumentTableWithDescriptor:pad error:&ate];
     if (!g_present_args) MDIE("failed to create the present argument table: %s", ate.localizedDescription.UTF8String);
     for (int i = 0; i < 3; i++) {
-        g_present_uv[i] = [g_dev newBufferWithLength:sizeof(float) * 12 options:MTLResourceStorageModeShared];
+        g_present_uv[i] = [g_dev newBufferWithLength:sizeof(float) * 16 options:MTLResourceStorageModeShared];   // 8 crop, 4 the conversion for the target, 4 box filter and sharpening (present.metal Crop)
         if (!g_present_uv[i]) MDIE("failed to create present UV buffer[%d]", i);
         res_add(g_present_uv[i]);
     }
@@ -17107,7 +17107,14 @@ void mtl_exec(const uint8_t *p) {
 }
 
 // ---------- Present: draw the swapchain texture to the CAMetalLayer; optional screenshot ----------
-static id<MTLRenderPipelineState> g_blit_pso, g_easu_pso; static MTLPixelFormat g_blit_fmt;
+static id<MTLRenderPipelineState> g_blit_pso, g_easu_pso, g_sharp_pso; static MTLPixelFormat g_blit_fmt;
+// DM_SHARPEN=0..1: contrast adaptive sharpening of the presented picture (0 = off, the default). Read once
+static float sharpen_amount(void) {
+    static float v = -1;
+    if (v < 0) { const char *e = getenv("DM_SHARPEN"); v = e ? strtof(e, NULL) : 0; if (v < 0) v = 0; if (v > 1) v = 1;
+                 if (v > 0) MLOG("DM_SHARPEN=%.2f: the presented picture is sharpened", v); }
+    return v;
+}
 static id<MTLSamplerState> g_blit_samp;
 static uint64_t g_present_n;
 uint64_t mtl_present_count(void) { return g_present_n; }   // Actual present count (heat attribution DM_HEAT computes the present frame rate)
@@ -17163,7 +17170,7 @@ static pthread_mutex_t g_shotq_mu = PTHREAD_MUTEX_INITIALIZER;
 static int present_encode(id<MTLCommandBuffer> cb, id<MTLTexture> src, id<MTLTexture> dst, const int crop[4]);
 static int present_crop_rect(id<MTLTexture> src, const int crop[4], NSUInteger r[4]);
 enum { PRESENT_FAILED, PRESENT_STANDARD, PRESENT_METALFX, PRESENT_METALFX_SNAP };   // METALFX_SNAP: the picture was scaled at the snapshot (snap_take) and the present drew it 1:1
-static int present_draw_m4(id<MTL4CommandBuffer> cb, id<MTLTexture> tex, const NSUInteger r[4], MTLViewport vp, id<MTLTexture> dst, id<MTLBuffer> uvb, int full, float mode, float knee, float target, int easu);
+static int present_draw_m4(id<MTL4CommandBuffer> cb, id<MTLTexture> tex, const NSUInteger r[4], MTLViewport vp, id<MTLTexture> dst, id<MTLBuffer> uvb, int full, float mode, float knee, float target, int easu, int taps);
 static int present_offscreen_m4(id<MTLTexture> src, const int crop[4], id<MTLTexture> out, void (^done)(int));
 static int present_offscreen_wait(id<MTLTexture> src, const int crop[4], id<MTLTexture> out);
 // Game picture needed by the whole-window screenshot (front end window_shot; no longer does drawViewHierarchy on a Metal layer with the display link attached): at the next present, the present thread draws the same frame
@@ -17623,6 +17630,9 @@ static void present_pipeline(MTLPixelFormat format) {
         pd.fragmentFunction = [lib newFunctionWithName:@"easu"];
         g_easu_pso = [g_dev newRenderPipelineStateWithDescriptor:pd error:&e];
         if (!g_easu_pso) MLOG("[RED] present FSR 1 pipeline failed (%s); DM_PRESENT_UPSCALE=fsr scales bilinearly", e.localizedDescription.UTF8String);
+        pd.fragmentFunction = [lib newFunctionWithName:@"sharp"];
+        g_sharp_pso = [g_dev newRenderPipelineStateWithDescriptor:pd error:&e];
+        if (!g_sharp_pso) MLOG("[RED] present sharpening pipeline failed (%s); DM_SHARPEN does nothing", e.localizedDescription.UTF8String);
         g_blit_fmt = format;
         MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new]; sd.minFilter = sd.magFilter = MTLSamplerMinMagFilterLinear; sd.supportArgumentBuffers = YES;
         g_blit_samp = [g_dev newSamplerStateWithDescriptor:sd];
@@ -17725,8 +17735,8 @@ static int present_encode(id<MTLCommandBuffer> cb, id<MTLTexture> src, id<MTLTex
     [en setViewport:vp];
     [en setRenderPipelineState:g_blit_pso]; [en setFragmentTexture:present_raw_src(src) atIndex:0]; [en setFragmentSamplerState:g_blit_samp atIndex:0];
     float md = present_mode(src.pixelFormat, dst.pixelFormat);
-    float uv[12] = {(float)cx / src.width, (float)cy / src.height, (float)cw / src.width, (float)ch / src.height,
-                   (cx + 0.5f) / src.width, (cy + 0.5f) / src.height, (cx + cw - 0.5f) / src.width, (cy + ch - 0.5f) / src.height, md, present_white(md), 0, 0};
+    float uv[16] = {(float)cx / src.width, (float)cy / src.height, (float)cw / src.width, (float)ch / src.height,
+                   (cx + 0.5f) / src.width, (cy + 0.5f) / src.height, (cx + cw - 0.5f) / src.width, (cy + ch - 0.5f) / src.height, md, present_white(md), 0, 0, 1, 1.0f / src.width, 1.0f / src.height, 0};   // the conversion; one tap, no sharpening: this pass draws as before
     { float k, t; if (uv[8] == 0.0f && dst.pixelFormat == MTLPixelFormatRGB10A2Unorm && present_rolloff(&k, &t)) { uv[8] = 4.0f; uv[10] = k; uv[11] = t; } }
     if (atomic_load_explicit(&g_origin_ll, memory_order_relaxed)) { uv[1] += uv[3]; uv[3] = -uv[3]; }   // lower-left origin: the window image is stored bottom-up
     [en setFragmentBytes:uv length:sizeof uv atIndex:0];
@@ -17752,6 +17762,16 @@ static id<MTL4Compiler> g_fx_comp;
 // bilinear pass per phase, so one run shows the cost (sw_mode; the [ab] line names PRESENT_UPSCALE). The decision is read per present (fx_on), on the display-link thread
 static int g_fx_mode = -1;   // 1 = metalfx, 0 = off, 2 + ... = ab (sw_mode)
 static int g_fsr;   // DM_PRESENT_UPSCALE=fsr: FSR 1's edge adaptive upsampling in the present pass (fsr_on); MetalFX stays off then
+// DM_PRESENT_UPSCALE_OUT=1.0..4.0: the share of the viewport the scaler reconstructs at, before the present averages it
+// back down (the box filter in the present shader). 1.0, the default, reconstructs at the viewport and draws 1:1 as before;
+// above that, reconstructing large and sampling down is supersampling, which costs GPU time and nothing else. Read once
+static float fx_out(void) {
+    static float v = -1;
+    if (v < 0) { const char *e = getenv("DM_PRESENT_UPSCALE_OUT"); v = e ? strtof(e, NULL) : 1.0f;
+                 if (!(v >= 1.0f && v <= 4.0f)) { if (e && *e) MLOG("[RED] DM_PRESENT_UPSCALE_OUT=%s: 1.0 to 4.0; keeping 1.0", e); v = 1.0f; }
+                 if (v > 1.0f) MLOG("DM_PRESENT_UPSCALE_OUT=%.2f: MetalFX reconstructs at %.2f of the viewport and the present averages it down", v, v); }
+    return v;
+}
 static int fx_mode(void) {
     if (g_fx_mode >= 0) return g_fx_mode;
     const char *e = getenv("DM_PRESENT_UPSCALE"); int v = 0;
@@ -17792,6 +17812,9 @@ static id<MTLTexture> fx_tex(__strong id<MTLTexture> *slot, MTLPixelFormat pf, N
 static id<MTLTexture> fx_encode(fx_state *fx, id<MTL4CommandBuffer> cb, id<MTLTexture> raw, const NSUInteger r[4], MTLViewport vp, MTLPixelFormat out_pf, int remake_wait, id<MTLTexture> canvas, int *wrote) {
     NSUInteger cw = r[2], ch = r[3], ow = (NSUInteger)vp.width, oh = (NSUInteger)vp.height;
     if (fx_mode() != 1 || !fx_wanted(vp, cw, ch)) return nil;
+    { float k = fx_out();   // reconstruct above the viewport where asked: the present pass averages it back down
+      if (k > 1.0f) { ow = (NSUInteger)(vp.width * k + 0.5); oh = (NSUInteger)(vp.height * k + 0.5);
+                      if (ow > 16384 || oh > 16384) { ow = (NSUInteger)vp.width; oh = (NSUInteger)vp.height; } } }   // Metal's 2D texture limit
     NSUInteger key[6] = {cw, ch, raw.pixelFormat, ow, oh, out_pf};
     id<MTL4FXSpatialScaler> sc = fx->sc;
     if (!sc || sc.inputWidth != cw || sc.inputHeight != ch || sc.colorTextureFormat != raw.pixelFormat || sc.outputWidth != ow || sc.outputHeight != oh || sc.outputTextureFormat != out_pf) {
@@ -18122,11 +18145,14 @@ static int present_encode_m4(id<MTL4CommandBuffer> cb, id<MTLTexture> src, id<MT
     if (up) { tex = up; r[0] = r[1] = 0; r[2] = up.width; r[3] = up.height; }   // the scaled picture, the viewport's size: drawn 1:1
     // FSR 1 upscales in the pass itself (DM_PRESENT_UPSCALE=fsr), for a picture drawn as stored: one the pass converts for its target (mode, the HDR output) takes the bilinear pass
     int easu = !up && fx && g_easu_pso && fsr_on() && mode == 0.0f && fx_wanted(vp, r[2], r[3]);
-    if (!present_draw_m4(cb, tex, r, vp, dst, uvb, full, mode, knee, target, easu)) return 0;
+    // DM_PRESENT_UPSCALE_OUT above 1.0: MetalFX reconstructed above the viewport, and the pass averages it back down over as many taps per axis as the reduction (at most 4x4);
+    // every other picture takes one tap, as before (a picture shown smaller than rendered included)
+    int taps = 1; if (up && fx_out() > 1.0f) { double red = fmax((double)up.width / vp.width, (double)up.height / vp.height); taps = (int)(red + 0.5); if (taps < 1) taps = 1; if (taps > 4) taps = 4; }
+    if (!present_draw_m4(cb, tex, r, vp, dst, uvb, full, mode, knee, target, easu, taps)) return 0;
     return up || easu ? PRESENT_METALFX : PRESENT_STANDARD;
 }
 // The present pass itself: tex's rectangle r drawn into vp of dst (full: vp covers dst). A ring slot's picture scaled at the snapshot (snap_take) is drawn through this alone, 1:1
-static int present_draw_m4(id<MTL4CommandBuffer> cb, id<MTLTexture> tex, const NSUInteger r[4], MTLViewport vp, id<MTLTexture> dst, id<MTLBuffer> uvb, int full, float mode, float knee, float target, int easu) {
+static int present_draw_m4(id<MTL4CommandBuffer> cb, id<MTLTexture> tex, const NSUInteger r[4], MTLViewport vp, id<MTLTexture> dst, id<MTLBuffer> uvb, int full, float mode, float knee, float target, int easu, int taps) {
     MTL4RenderPassDescriptor *rp = [MTL4RenderPassDescriptor new];
     rp.colorAttachments[0].texture = dst;
     rp.colorAttachments[0].loadAction = full ? MTLLoadActionDontCare : MTLLoadActionClear;
@@ -18142,9 +18168,12 @@ static int present_draw_m4(id<MTL4CommandBuffer> cb, id<MTLTexture> tex, const N
     uv[0] = (float)cx / tw; uv[1] = (float)cy / th; uv[2] = (float)cw / tw; uv[3] = (float)ch / th;
     uv[4] = (cx + 0.5f) / tw; uv[5] = (cy + 0.5f) / th; uv[6] = (cx + cw - 0.5f) / tw; uv[7] = (cy + ch - 0.5f) / th;
     uv[8] = mode; uv[9] = present_white(mode); uv[10] = knee; uv[11] = target;   // mode, knee, target: the conversion for the target (present_encode_m4)
+    uv[12] = (float)taps; uv[13] = 1.0f / tw; uv[14] = 1.0f / th; uv[15] = sharpen_amount();   // box filter taps per axis (present_encode_m4) and sharpening (DM_SHARPEN)
     if (atomic_load_explicit(&g_origin_ll, memory_order_relaxed)) { uv[1] += uv[3]; uv[3] = -uv[3]; }   // lower-left origin: the window image is stored bottom-up
     [g_present_args setAddress:uvb.gpuAddress atIndex:0];
-    [en setViewport:vp]; [en setRenderPipelineState:easu ? g_easu_pso : g_blit_pso];
+    [en setViewport:vp];
+    // Sharpening replaces the box filter rather than following it: both read the same constants, so only the pipeline changes; FSR 1 (easu) does its own
+    [en setRenderPipelineState:easu ? g_easu_pso : (sharpen_amount() > 0 && g_sharp_pso) ? g_sharp_pso : g_blit_pso];
     [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     m4_end(en);
     return 1;
@@ -18153,7 +18182,7 @@ static int present_draw_m4(id<MTL4CommandBuffer> cb, id<MTLTexture> tex, const N
 // returns whether it was submitted. Completion reports the encoding kind, or PRESENT_FAILED on a GPU error. Resources remain resident and retained until GPU completion.
 static int present_offscreen_m4(id<MTLTexture> src, const int crop[4], id<MTLTexture> out, void (^done)(int)) {
     id<MTL4CommandAllocator> al = [g_dev newCommandAllocator]; id<MTL4CommandBuffer> cb = [g_dev newCommandBuffer];
-    id<MTLBuffer> uvb = [g_dev newBufferWithLength:sizeof(float) * 12 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> uvb = [g_dev newBufferWithLength:sizeof(float) * 16 options:MTLResourceStorageModeShared];
     if (!al || !cb || !uvb) { MLOG("[RED] offscreen present: no command allocator or buffer"); return 0; }
     id<MTLTexture> raw = present_raw_src(src);
     fx_state fx = {0};
@@ -18324,7 +18353,7 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     if (snap_up_for(up_slot, up_gen, dr.texture.width, dr.texture.height, dr.texture.pixelFormat, &up, &upvp)) {   // scaled at the snapshot (snap_take): drawn 1:1, no scaler here
         NSUInteger r[4] = {0, 0, up.width, up.height}; present_pipeline(dr.texture.pixelFormat);
         int full = upvp.originX == 0 && upvp.originY == 0 && (NSUInteger)upvp.width == dr.texture.width && (NSUInteger)upvp.height == dr.texture.height;
-        kind = present_draw_m4(cb, up, r, upvp, dr.texture, g_present_uv[alloc_i], full, 0.0f, 0.0f, 0.0f, 0) ? PRESENT_METALFX_SNAP : 0;   // as stored: snap_take scales only a picture that needs no conversion
+        kind = present_draw_m4(cb, up, r, upvp, dr.texture, g_present_uv[alloc_i], full, 0.0f, 0.0f, 0.0f, 0, 1) ? PRESENT_METALFX_SNAP : 0;   // as stored: snap_take scales only a picture that needs no conversion
     } else {
         snap_up_stale(up_slot, up_gen);   // counts a picture scaled for another canvas: the present's own scaler this frame
         kind = present_encode_m4(cb, src, dr.texture, crop, g_present_uv[alloc_i], &g_fx_present);
@@ -18870,7 +18899,7 @@ static uint64_t snap_take(const tex_t *t, const int crop[4]) {
     g_snap[k].up_gen++; g_snap[k].up_valid = 0;
     NSUInteger dw, dh, r[4]; MTLPixelFormat pf;
     // Only a picture the present would draw as stored: one it converts for its target (present_mode: the PQ HDR layer, an HDR10 window brought to SDR, a roll-off) is scaled by the present, which converts it
-    float rk, rt; int plain = snap_canvas(&dw, &dh, &pf) && present_mode(src.pixelFormat, pf) == 0.0f && !(pf == MTLPixelFormatRGB10A2Unorm && present_rolloff(&rk, &rt));
+    float rk, rt; int plain = snap_canvas(&dw, &dh, &pf) && present_mode(src.pixelFormat, pf) == 0.0f && !(pf == MTLPixelFormatRGB10A2Unorm && present_rolloff(&rk, &rt)) && fx_out() <= 1.0f;   // and not supersampled (DM_PRESENT_UPSCALE_OUT): the present does that
     if (fx_at_snap_on() && fx_on() && plain && present_crop_rect(src, crop, r)) {
         id<MTLTexture> raw = present_raw_src(src); MTLViewport vp = present_viewport(r[2], r[3], dw, dh); NSUInteger ow = (NSUInteger)vp.width, oh = (NSUInteger)vp.height;
         if (fx_wanted(vp, r[2], r[3]) && fx_prepare(&g_fx_snap, r[2], r[3], raw.pixelFormat, ow, oh, pf, 0)) {

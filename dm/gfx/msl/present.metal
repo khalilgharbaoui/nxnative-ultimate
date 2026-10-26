@@ -7,7 +7,7 @@ vertex V vs(uint id [[vertex_id]]) { float2 uv = float2((id << 1) & 2, id & 2); 
 // 1 an HDR10 source (the game's RGB10A2 window: SMPTE ST 2084 code values in BT.2020 primaries) for an SDR target, where mode.y is the paper white in nits; 2 a gamma-coded BT.709 (sRGB) source for the PQ layer (RGB10A2 in BT.2100 PQ, DM_HDR): fs encodes it as HDR10 at the paper white;
 // 3 a float source (linear BT.709) for the PQ layer, encoded the same way (untested: no local game presents a float window); 4 the HDR10 window for the PQ layer without metadata,
 // rolled off above mode.z nits into mode.w nits (hle_vi.c dm_hdr_rolloff). mode.z and mode.w are unused otherwise.
-struct Crop { float4 rect; float4 edge; float4 mode; };
+struct Crop { float4 rect; float4 edge; float4 mode; float4 box; };
 // Linear BT.709 and BT.2020 (ITU-R BT.2087; each row sums to 1, so white stays white). Metal's float3x3 takes its columns.
 constant float3x3 kRec709To2020 = float3x3(float3(0.627404, 0.069097, 0.016391), float3(0.329283, 0.919540, 0.088013), float3(0.043313, 0.011362, 0.895595));
 constant float3x3 kRec2020To709 = float3x3(float3(1.660491, -0.124550, -0.018151), float3(-0.587641, 1.132900, -0.100579), float3(-0.072850, -0.008349, 1.118730));
@@ -41,11 +41,8 @@ static inline float3 present_to_sdr_white(float3 c0) {
     float m = max(max(c.r, c.g), c.b);
     return m > 1.0 ? c * (1.0 / m) : c;
 }
-// Every target. The PQ HDR layer (RGB10A2 in BT.2100 PQ): the game's HDR10 window as it is (mode 0), an SDR or float source encoded as HDR10 at the paper white
-// (modes 2, 3). The SDR drawable (gamma-coded 8-bit, BT.709; a screenshot): an HDR10 source at its paper white, its highlights brought to SDR white with their hue
-// (present_to_sdr_white), then converted to BT.709; a colour outside BT.709 is clipped
-fragment float4 fs(V in [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]], constant Crop& c [[buffer(0)]]) {
-    float4 v = t.sample(s, clamp(in.uv * c.rect.zw + c.rect.xy, c.edge.xy, c.edge.zw));
+// The conversion for the target (mode, above), shared by fs and sharp
+static inline float4 present_convert(float4 v, constant Crop& c) {
     if (c.mode.x > 3.5) {   // the PQ layer without metadata: the game's HDR10 window, its pixels above the knee (mode.z, nits) compressed into the screen's peak (mode.w)
         float3 n = present_pq_to_linear(v.rgb, 1.0); float m = max(max(n.r, n.g), n.b), k = c.mode.z, pk = c.mode.w;
         if (m > k) n *= (k + (pk - k) * (1.0 - exp(-(m - k) / (pk - k)))) / m;   // slope 1 at the knee, towards the peak; the brightest channel sets it, so the hue is kept
@@ -55,6 +52,37 @@ fragment float4 fs(V in [[stage_in]], texture2d<float> t [[texture(0)]], sampler
     else if (c.mode.x > 1.5) v.rgb = present_linear_to_pq(kRec709To2020 * present_srgb_to_linear(v.rgb), c.mode.y);   // the PQ layer: an SDR source as HDR10 at the paper white
     else if (c.mode.x > 0.5) v.rgb = present_linear_to_srgb(saturate(kRec2020To709 * present_to_sdr_white(present_pq_to_linear(v.rgb, c.mode.y))));
     return v;
+}
+// Every target. The PQ HDR layer (RGB10A2 in BT.2100 PQ): the game's HDR10 window as it is (mode 0), an SDR or float source encoded as HDR10 at the paper white
+// (modes 2, 3). The SDR drawable (gamma-coded 8-bit, BT.709; a screenshot): an HDR10 source at its paper white, its highlights brought to SDR white with their hue
+// (present_to_sdr_white), then converted to BT.709; a colour outside BT.709 is clipped
+// box.x: taps per axis (1 = one bilinear sample). A single bilinear tap reads 4 texels whatever the reduction, so a picture
+// scaled above the viewport and sampled down this way throws nearly all of it away. With n taps the whole footprint is
+// averaged, which makes DM_PRESENT_UPSCALE_OUT above 1.0 real supersampling (only then is it more than 1: nvn_mtl.m present_encode_m4). box.yz: one source texel in uv. box.w: sharpening
+fragment float4 fs(V in [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]], constant Crop& c [[buffer(0)]]) {
+  float2 uv = clamp(in.uv * c.rect.zw + c.rect.xy, c.edge.xy, c.edge.zw);
+  int n = int(c.box.x);
+  if (n <= 1) return present_convert(t.sample(s, uv), c);
+  float4 a = 0;
+  for (int y = 0; y < n; y++) for (int x = 0; x < n; x++) {
+    float2 o = (float2(x, y) - 0.5 * float(n - 1)) * c.box.yz;
+    a += t.sample(s, clamp(uv + o, c.edge.xy, c.edge.zw));
+  }
+  return present_convert(a / float(n * n), c);
+}
+// Contrast adaptive sharpening of the presented picture (DM_SHARPEN): the 5 tap cross around the pixel. The low pass is the mean
+// of the four neighbours; adding back the difference lifts edges and leaves flat areas alone. Clamped to the neighbourhood's own
+// range, so it cannot ring or halo. Taken instead of fs, not after it, so sharpening costs no extra pass
+fragment float4 sharp(V in [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]], constant Crop& c [[buffer(0)]]) {
+  float2 uv = clamp(in.uv * c.rect.zw + c.rect.xy, c.edge.xy, c.edge.zw), d = c.box.yz;
+  float3 e = t.sample(s, uv).rgb;
+  float3 n0 = t.sample(s, clamp(uv + float2(-d.x, 0), c.edge.xy, c.edge.zw)).rgb;
+  float3 n1 = t.sample(s, clamp(uv + float2( d.x, 0), c.edge.xy, c.edge.zw)).rgb;
+  float3 n2 = t.sample(s, clamp(uv + float2(0, -d.y), c.edge.xy, c.edge.zw)).rgb;
+  float3 n3 = t.sample(s, clamp(uv + float2(0,  d.y), c.edge.xy, c.edge.zw)).rgb;
+  float3 lo = min(min(n0, n1), min(n2, n3)), hi = max(max(n0, n1), max(n2, n3));
+  float3 r = e + (e - (n0 + n1 + n2 + n3) * 0.25) * c.box.w;
+  return present_convert(float4(clamp(r, min(lo, e), max(hi, e)), 1), c);   // then converted for the target, as fs
 }
 // FSR 1 draws the picture as stored (mode.x 0): a picture the pass converts for its target (the HDR layer, an HDR10 window into SDR) takes fs (nvn_mtl.m present_encode_m4)
 // Edge adaptive spatial upsampling (DM_PRESENT_UPSCALE=fsr): AMD FidelityFX Super Resolution 1.0's EASU (MIT licence, Copyright (c) 2021 Advanced Micro Devices, Inc.),
