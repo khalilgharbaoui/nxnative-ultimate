@@ -1902,7 +1902,12 @@ void front_run(void (*guest)(void)) {
     @autoreleasepool {
         [NSApplication sharedApplication];
         [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
-        NSRect r = NSMakeRect(0, 0, 1280, 720);
+        // Window size: 1280x720 points, as before; DM_WINDOW_SIZE=WxH (PR #619, which also made 1920x1080 the default) sets another size in points
+        double w = 1280, h = 720;
+        const char *ws = getenv("DM_WINDOW_SIZE");
+        if (ws && (sscanf(ws, "%lfx%lf", &w, &h) != 2 || w <= 0 || h <= 0)) { w = 1280; h = 720; }
+        if (ws) LOG("window %.0fx%.0f points (DM_WINDOW_SIZE)", w, h);
+        NSRect r = NSMakeRect(0, 0, w, h);
         NSWindow *win = [[NSWindow alloc] initWithContentRect:r
                                                     styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable
                                                       backing:NSBackingStoreBuffered defer:NO];
