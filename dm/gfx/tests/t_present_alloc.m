@@ -4,6 +4,7 @@
 @interface FakeLinkUpdate : NSObject
 @property id<CAMetalDrawable> drawable;
 @property CFTimeInterval targetPresentationTimestamp;
+@property CFTimeInterval targetTimestamp;   // the callback's submission deadline (the display-link timing rows read it)
 @end
 @implementation FakeLinkUpdate
 @end
@@ -37,7 +38,7 @@ static id<CAMetalDrawable> drawable(void) {
 }
 static NvMetalDisplayLinkDelegate *g_delegate;
 static id<CAMetalDrawable> tick_with(id<CAMetalDrawable> dr) {   // one display-link callback (it does not look at the link)
-    FakeLinkUpdate *u = [FakeLinkUpdate new]; u.drawable = dr; u.targetPresentationTimestamp = CACurrentMediaTime() + 0.016;
+    FakeLinkUpdate *u = [FakeLinkUpdate new]; u.drawable = dr; u.targetPresentationTimestamp = CACurrentMediaTime() + 0.016; u.targetTimestamp = u.targetPresentationTimestamp - 0.008;
     [g_delegate metalDisplayLink:(CAMetalDisplayLink *)(id)u needsUpdate:(CAMetalDisplayLinkUpdate *)u];
     return dr;
 }
