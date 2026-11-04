@@ -3,7 +3,7 @@
 The screen before the game starts shows the settings the game supports. A setting that only matters while another is on appears under it and disappears when that one is turned off. Tap **Play** to start; the app remembers your choices for the next start. All settings are on one scrollable screen, under **Game**, **Controls** and **Performance**. Tap a menu or move a slider there; no settings page needs opening. **Upscaling** is in **Game**, beside **Console mode**. A Mac app shows the same settings in a [window of its own](#the-mac-settings-window).
 
 - [Tested defaults](#tested-defaults)
-- [Game](#game): [Frame rate](#frame-rate), [Render scale](#render-scale), [Console mode](#console-mode), [Upscaling](#upscaling), [Upscaling detail](#upscaling-detail), [Sharpening](#sharpening), [Game's upscaler](#games-upscaler), [Anisotropic filtering](#anisotropic-filtering), [Trilinear filtering](#trilinear-filtering), [Game language](#game-language), [Picture](#picture), [Volume](#volume), [HDR output](#hdr-output), [HDR paper white](#hdr-paper-white), [HDR peak](#hdr-peak), [Frame-rate counter](#frame-rate-counter)
+- [Game](#game): [Frame rate](#frame-rate), [Render scale](#render-scale), [Console mode](#console-mode), [Upscaling](#upscaling), [Upscaling detail](#upscaling-detail), [Sharpening](#sharpening), [Game's upscaler](#games-upscaler), [Anisotropic filtering](#anisotropic-filtering), [Trilinear filtering](#trilinear-filtering), [Game language](#game-language), [Picture](#picture), [Audio limiter](#audio-limiter), [Volume](#volume), [HDR output](#hdr-output), [HDR paper white](#hdr-paper-white), [HDR peak](#hdr-peak), [Frame-rate counter](#frame-rate-counter)
 - [Controls](#controls): [Touch feedback](#touch-feedback), [Game rumble](#game-rumble), [Rumble strength](#rumble-strength), [Rumble cutoff](#rumble-cutoff), [Motion controls](#motion-controls), [Press a button to join](#press-a-button-to-join)
 - [Performance](#performance): [Frame buffering](#frame-buffering), [Metal 4 pipelines](#metal-4-pipelines), [Pipeline prebuild](#pipeline-prebuild), [Encode thread](#encode-thread), [Hold frames when late](#hold-frames-when-late), [Performance HUD](#performance-hud), [Reset to tested defaults](#reset-to-tested-defaults)
 - [The Mac settings window](#the-mac-settings-window): [Display mode](#display-mode), [Pause in the background](#pause-in-the-background)
@@ -143,6 +143,13 @@ Games whose profile supports it (Breath of the Wild, Animal Crossing: New Horizo
 ### Volume
 
 The loudness of the game's sound, **Muted** or 20 to 100 % in steps of 20, on top of the game's own volume and the device's. A change while the game plays fades in over one audio block, without a click. The steps follow a loudness curve: 60 % is about a third of the amplitude (-9 dB), 20 % about a twenty-fifth (-28 dB). On the iPhone and iPad the [in-game menu](#in-game-menu) changes it while the game runs.
+
+### Audio limiter
+
+A game that mixes its voices with no headroom can pass the loudest level a sound output holds. The Switch and this app cut such peaks flat, which is heard as crackle in loud scenes. With the limiter on, the app looks about 1 ms ahead in the sound it is about to play (no delay is added) and turns the whole mix down before a peak reaches that level, instead of cutting it flat; the volume comes back with a time constant of 50 ms (both channels together, so the stereo picture stays). A mix that stays below the level is not changed at all.
+
+- **When to change it:** turn it on if a game crackles in loud scenes. It is off by default, because the console does not have it.
+- **Cost:** none in speed; loud passages are a little quieter than on the Switch for a moment after each peak.
 
 ### Frame-rate counter
 
@@ -344,6 +351,7 @@ A line like `DM_PRESENT_SNAP=0` in `Documents/env.txt` (in the Files app, under 
 | Picture (iPhone and iPad) | `DM_PICTURE_FIT` | `fit` 16:9 with black bars, `fill` covers the screen, cropped |
 | Picture shape | `DM_SCREEN_ASPECT` | `auto` the app window's own shape where it is taller than 16:9 (iPad 4:3, iPhone Duo 1.43:1), else 16:9 (iOS only); `1.6` MacBook (16:10, Mac only); `1.43` the iPhone Duo's shape, `0` 16:9 |
 | Volume | `DM_VOLUME` | `0`, `0.2`, `0.4`, `0.6`, `0.8`, `1.0` (any value from `0` to `1` works from the file) |
+| Audio limiter | `DM_AUDIO_LIMIT` | `1`, `0` |
 | Frame-rate counter | `DM_SHOW_FPS` | `1`, `0` |
 | Touch feedback | `DM_TOUCH_HAPTICS` | `1`, `0` |
 | Game rumble | `DM_RUMBLE` | `1`, `0` |
