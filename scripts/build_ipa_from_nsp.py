@@ -75,7 +75,7 @@ PSO_GPUS = ''                           # NVN games: GPU architectures the app g
                                         #   empty = by the game's profile: its pso_gpu key (whitespace-separated architectures, joined with commas) when it sets pso_mtl4 on (the Metal 4 path, the only one that reads the archive on iOS, is on for it),
                                         #   else 'g18p' for a game without the key, and 'none' without pso_mtl4 on
                                         #   PLATFORM 'mac-app': the Mac app's archive (Resources/pso), empty = this Mac's GPU (e.g. 'g14s' for an M2 Max), 'none' = the app builds its bases on its first start
-SHOW_FPS = True                         # True shows the game's frame rate on the iPhone (frames on screen per second, top left); DM_SHOW_FPS=0 / 1 in the app's Documents/env.txt changes it without a rebuild
+SHOW_FPS = True                         # True shows the game's frame rate (frames on screen per second, top left; on the Mac also the longest frame and the GPU time): on the iPhone DM_SHOW_FPS=0 / 1 in the app's Documents/env.txt changes it without a rebuild, on the Mac the run command's DM_SHOW_FPS, the app's settings window or Window > Frame-Rate Counter
 MOTION = True                           # True passes a gyro controller's motion (on iOS also the phone's own) to games that read it; False builds with DM_MOTION=0, for when motion misbehaves (DM_MOTION=1 in the app's Documents/env.txt turns it back on without a rebuild)
 SURVEY_ONLY = False                     # a game with no profile in dm/games: only write the survey, no provisional profile and no IPA
 PROFILE_OUT = ''                        # where a provisional profile goes (empty = <build folder>/profile, i.e. <NSP folder>/<title ID>_build/profile unless WORK_DIR is set; the profile is <this>/<title ID>/)
@@ -2623,12 +2623,13 @@ def mac_host(py, repo, work, env, logs, g):
     return host, font
 
 
-def mac_run(work, game, patched, host, font, msl, aoc, gfx, lang, env, logs, g, env_file='', partial=False, parts=None, jit=False):
+def mac_run(work, game, patched, host, font, msl, aoc, gfx, lang, env, logs, g, env_file='', partial=False, parts=None, jit=False, fps=False):
     """The command that runs the game in a window with sound after a Mac-only build (PLATFORM 'mac'; docs/development.md, Build by hand (Mac), step 5): its save and temporary storage in
     <id>_build/run (kept from run to run), the extracted RomFS, the Mac shader libraries (msl), the DLC, the profile's shader map (a host outside dm/host does not find it beside itself;
     c1_full.tsv and cb_extent.tsv are read beside it), the game language, and the switches of an environment file (DM_ENV_FILE / --env-file). partial (--seen-shaders): the pipeline bases go into an
     archive of their own, as the prebuild's stamp does not name the library (the whole library would find its bases done), and the command keeps its log, which the next partial build reads.
-    parts: a dict that gets the command's parts (a multi-program application's programs.tsv, mac_programs). jit: what the game's nn::jit plugin makes in play goes to jit_capture/play, for the iPhone's image (capture_jit)"""
+    parts: a dict that gets the command's parts (a multi-program application's programs.tsv, mac_programs). jit: what the game's nn::jit plugin makes in play goes to jit_capture/play, for the iPhone's image (capture_jit).
+    fps: the frame-rate counter at the window's top left (SHOW_FPS / --show-fps, DM_SHOW_FPS=1; an environment file's DM_SHOW_FPS wins)"""
     rd = work / 'run'
     for d in ('save', 'temp'): (rd / d).mkdir(parents=True, exist_ok=True)
     renv = {'DM_ROOT': work, 'DM_ROMFS': rfs.source(game), 'DM_SAVE': rd / 'save', 'DM_TEMP': rd / 'temp', 'DM_MSL_DIR': msl, 'DM_FONT_DIR': font}
@@ -2640,6 +2641,7 @@ def mac_run(work, game, patched, host, font, msl, aoc, gfx, lang, env, logs, g, 
     if jit: (game / 'jit_capture/play').mkdir(parents=True, exist_ok=True); renv['DM_JIT_CAPTURE'] = game / 'jit_capture/play'
     if PROGRAM_INDEX and g.get('program_of', ''): renv['DM_PROGRAM'] = PROGRAM_INDEX   # the host over the application's programs runs this one (main.c dm_game_cur)
     renv.update(DM_LANG=lang, DM_WINDOW=1, DM_AUDIO=1)
+    if fps: renv['DM_SHOW_FPS'] = 1
     if env_file: renv.update(env_file_pairs(env_file))
     if gfx == 'nvn' and g.table('shader_pairs.tsv').is_file():
         if not g.table('pso_pairs.tsv').is_file() and (work / 'shader/pso_pairs.tsv').is_file(): renv['DM_PSO_PAIRS'] = work / 'shader/pso_pairs.tsv'   # split_shaders' copy
@@ -2678,7 +2680,7 @@ def mac_programs(args, g, first):
     tsv = Path(first['cwd']).parent / 'programs.tsv'
     rows = ['# The programs of this multi-program application on the Mac (build_ipa_from_nsp.py): index, the host (exe), rewritten modules (arg), run folder (cwd) and environment; DM_PROGRAMS names this file (hle_oe.c)']
     for n, r in runs.items():
-        kv = {k: v for k, v in r['env'].items() if k not in ('DM_WINDOW', 'DM_AUDIO')}   # the run command's own switches, which every program inherits
+        kv = {k: v for k, v in r['env'].items() if k not in ('DM_WINDOW', 'DM_AUDIO', 'DM_SHOW_FPS')}   # the run command's own switches, which every program inherits
         kv['DM_SAVE'] = first['env']['DM_SAVE']
         rows.append('\t'.join([str(n), f'exe={first["host"]}', f'arg={r["arg"]}', f'cwd={r["cwd"]}'] + [f'{k}={v}' for k, v in kv.items()]))
     tsv.write_text('\n'.join(rows) + '\n')
@@ -2736,7 +2738,7 @@ def mac_app_name(name):   # the app's file name: the game name with the characte
     return re.sub(r'\s*[:/]\s*', ' - ', name).strip(' .-') or 'nxnative'
 
 
-def mac_app(py, repo, out, app, work, game, patched, host, font, msl, aoc, gfx, lang, g, name, version, bundle_id, icon, sign, env, logs, env_file='', gpus='', programs=None, control=None):
+def mac_app(py, repo, out, app, work, game, patched, host, font, msl, aoc, gfx, lang, g, name, version, bundle_id, icon, sign, env, logs, env_file='', gpus='', programs=None, control=None, fps=False):
     """The last stage of PLATFORM 'mac-app': pack the Mac app (dm/mac/pack_app.py) from what a Mac-only build made: the Mac host and font (mac_host), the packed version's RomFS and rewritten
     modules, the Mac shader libraries (msl: <shader>/cache, whose b-<chain> goes in, or a Vulkan or GL game's <shader>, whose vk / gl goes in), the DLC, the profile's tables (with the shader pairs
     the pipeline prebuild reads), the pipeline archive made offline for this Mac (mac_pso; gpus: --gpu / PSO_GPUS), the launcher settings and an environment file.
@@ -2745,9 +2747,10 @@ def mac_app(py, repo, out, app, work, game, patched, host, font, msl, aoc, gfx, 
     lib = msl / (f'b-{chain_of(repo)}' if gfx == 'nvn' else 'vk' if gfx == 'vulkan' else 'gl')
     pso = mac_pso(py, repo, work, lib, g, gpus, env, logs) if gfx == 'nvn' and g.table('shader_pairs.tsv').is_file() else None   # a stage of its own, before the app's
     PROG.stage('Mac app', step='starting')
-    # The launcher settings the IPA carries (dm/games/settings.py), without the iPhone's own switches: the app's settings window and Mac front ends show them (docs/frontends.md)
+    # The launcher settings the IPA carries (dm/games/settings.py), without the iPhone's own switches: the app's settings window and Mac front ends show them (docs/frontends.md); fps is the
+    # Frame-rate counter row's default (SHOW_FPS / --show-fps)
     settings = work / 'app/launcher.json'; settings.parent.mkdir(parents=True, exist_ok=True)
-    run([py, repo / 'dm/games/settings.py', g.id, patched, control or game / 'control.nacp', settings], logs / 'mac_settings.log', env=dict(env, GFXAPI=gfx, SETTINGS_PLATFORM='mac', DM_LANG=lang))
+    run([py, repo / 'dm/games/settings.py', g.id, patched, control or game / 'control.nacp', settings], logs / 'mac_settings.log', env=dict(env, GFXAPI=gfx, SETTINGS_PLATFORM='mac', DM_LANG=lang, DM_SHOW_FPS='1' if fps else '0'))
     cmd = [py, repo / 'dm/mac/pack_app.py', out, '--host', host, '--patched', patched, '--romfs', rfs.source(game), '--msl', lib, '--tables', g.table('shader_map.tsv').parent,
            '--font', font, '--title-id', f'{app:016X}', '--name', name, '--bundle-id', bundle_id, '--lang', lang, '--sign', sign or '-']
     split_pairs = work / 'shader/pso_pairs.tsv'   # the split's copy of pso_pairs.tsv, for a profile without the table (as mac_run's DM_PSO_PAIRS)
@@ -2808,7 +2811,7 @@ def parse_args(argv):
                     'With --platform mac-app: the Mac app\'s archive, by default for this Mac\'s GPU (none: the app builds the bases on its first start)')
     ap.add_argument('--seen-shaders', action=argparse.BooleanOptionalAction, help='--platform mac or mac-app: build only the shaders the profile\'s playtests used (its shader_seen.tsv) and those the last runs\' logs reported missing, not the whole map: '
                     'minutes instead of hours, but areas the list does not cover draw without the rest until this runs again (default: the SEEN_SHADERS setting, off)')
-    ap.add_argument('--show-fps', action=argparse.BooleanOptionalAction, help='show the game\'s frame rate on the iPhone, frames on screen per second at the top left (default: the SHOW_FPS setting, on)')
+    ap.add_argument('--show-fps', action=argparse.BooleanOptionalAction, help='show the game\'s frame rate on the iPhone and the Mac, frames on screen per second at the top left (default: the SHOW_FPS setting, on)')
     ap.add_argument('--motion', action=argparse.BooleanOptionalAction, help='pass a gyro controller\'s motion (on iOS also the phone\'s own) to games that read it; --no-motion builds with DM_MOTION=0, for when motion misbehaves (default: the MOTION setting, on)')
     ap.add_argument('--survey-only', action='store_true', help='a game with no profile: only the survey, no provisional profile and no IPA')
     ap.add_argument('--program', type=int, default=None, help='a multi-program application (Super Mario 3D All-Stars): pack program N of the NSPs as a game of its own, title ID = the application\'s + N (default: the PROGRAM_INDEX setting, 0; a game whose profile lists programs packs them all as one from program 0: this is for bring-up)')
@@ -3157,7 +3160,7 @@ def main(args=None):
         programs = other_programs(args, g)
         if not icon: say(('no game icon: the NUP carries none' if nup else 'no game icon: a dump folder has no control data') + '; the app\'s icon will be blank; --icon / ICON gives it one' if dump else '[RED] no game icon in the extraction (an older extraction did not save it: delete extract/ and run again); the app\'s icon will be blank')
         mac_app(py, repo, out_ipa, app, work, game, patched, host, font, ios, aoc, gfx, lang, g, app_name, app_version, bundle_id, icon, args.mac_sign or MAC_SIGN, env, logs, env_file,
-                (args.gpu or PSO_GPUS).strip(), programs, control)
+                (args.gpu or PSO_GPUS).strip(), programs, control, fps=SHOW_FPS if args.show_fps is None else args.show_fps)
         rmtree(work / 'tmp')
         say(f'done: {out_ipa} ({tree_size(out_ipa)[1] / 2**30:.1f} GB); '
             f'open it from Finder. Its save is in ~/Library/Application Support/nxnative/{app:016X}/, its log in ~/Library/Logs/nxnative/{app:016X}.log')
@@ -3168,7 +3171,7 @@ def main(args=None):
         first = getattr(args, 'in_programs', None)   # a program packed with the application's first: its host, built over all of them, and its fonts
         host, font = (first['host'], first['font']) if first else mac_host(py, repo, work, env, logs, g)
         parts = {'font': font}
-        cmd = mac_run(work, game, patched, host, font, ios, aoc, gfx, lang, env, logs, g, env_file, partial=seen_shaders, parts=parts, jit=jit)
+        cmd = mac_run(work, game, patched, host, font, ios, aoc, gfx, lang, env, logs, g, env_file, partial=seen_shaders, parts=parts, jit=jit, fps=SHOW_FPS if args.show_fps is None else args.show_fps)
         rmtree(work / 'tmp')
         if getattr(args, 'in_programs', False): return parts
         programs = None if PROGRAM_INDEX else mac_programs(args, g, parts)

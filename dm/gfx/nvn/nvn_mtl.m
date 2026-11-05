@@ -15277,6 +15277,19 @@ static id<MTLRenderPipelineState> g_blit_pso; static MTLPixelFormat g_blit_fmt;
 static id<MTLSamplerState> g_blit_samp;
 static uint64_t g_present_n;
 uint64_t mtl_present_count(void) { return g_present_n; }   // Actual present count (heat attribution DM_HEAT computes the present frame rate)
+// The Mac frame-rate counter (front_mac.m, DM_SHOW_FPS): the longest time between two presents since its last reading, or since the last present when that is longer (a freeze shows
+// there while it lasts, not in the frame rate: a second with no present read 0 ms), and the mean GPU time of the frames completed since then. Frames are taken 8 behind the current one, as
+// the timing line does (hle_nvn.c), so their command buffers have ended; one reader, the main thread
+static _Atomic uint64_t g_present_gap_max, g_present_last;
+void mtl_frame_stats(double *gap_max_ms, double *gpu_ms) {
+    uint64_t gap = atomic_exchange(&g_present_gap_max, 0), last = atomic_load(&g_present_last), now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    if (last && now > last && now - last > gap) gap = now - last;
+    *gap_max_ms = gap / 1e6;
+    static uint64_t from; uint64_t cur = atomic_load(&g_cur_frame), to = cur > 8 ? cur - 8 : 0, lo = from > to || to - from > 600 ? (to > 600 ? to - 600 : 0) : from;
+    double sum = 0; int n = 0;
+    for (uint64_t f = lo; f < to; f++) { double g = mtl_gpu_ms(f); if (g >= 0) { sum += g; n++; } }
+    from = to; *gpu_ms = n ? sum / n : -1;
+}
 void mtl_res_snapshot(mtl_res_count *out) {
     memset(out, 0, sizeof *out);
     out->pso = g_pso.n;
@@ -16114,6 +16127,8 @@ static int present_after_gpu(CAMetalLayer *layer) {
 static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t ticket, const int crop[4], id<CAMetalDrawable> supplied, double target_ts) {
     if (g_present_stall_ns) { struct timespec ts = {0, (long)g_present_stall_ns}; nanosleep(&ts, NULL); }
     g_present_n++;
+    { uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW), last = atomic_exchange(&g_present_last, now), gap = last ? now - last : 0, m = atomic_load(&g_present_gap_max);
+      while (gap > m && !atomic_compare_exchange_weak(&g_present_gap_max, &m, gap)) {} }
     if (bootprof() && (g_present_n == 1 || g_present_n % 120 == 0)) {
         if (g_present_n == 1) g_bp_first_present = bp_now() - g_bp_t0;
         MLOG("[bootprof] t=%.3f s present #%llu: metallibs loaded %llu / %.1f ms; pipelines created %llu / %.1f ms (all synchronous on the submit thread); prewarmed and used: shaders %llu / render pipelines %llu / compute pipelines %llu; "

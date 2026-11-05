@@ -683,6 +683,39 @@ void front_picture_shape(int w, int h) { if (w > 0 && h > 0) g_picture_aspect = 
 - (void)viewDidChangeBackingProperties { [super viewDidChangeBackingProperties]; [self fitDrawable]; }
 @end
 
+// Frame-rate counter (DM_SHOW_FPS=1, the iPhone's switch; the NSP script's Mac run command sets it unless --no-show-fps; Window > Frame-Rate Counter turns it on and off): top left over
+// the picture, once a second, the frames put on screen in that second (nvn_mtl.m counts them for NVN and the Vulkan layer alike), the longest time between two of them (a freeze shows
+// there and not in the rate) and the mean GPU time of the frames completed in that second. A longer span than 1.5 s (the app was stopped in a debugger) shows no reading
+uint64_t mtl_present_count(void);
+void mtl_frame_stats(double *gap_max_ms, double *gpu_ms);
+static NSTextField *g_fps; static NSTimer *g_fps_timer;
+static void fps_show(BOOL on) {
+    if (!on) { [g_fps_timer invalidate]; g_fps_timer = nil; [g_fps removeFromSuperview]; g_fps = nil; return; }
+    if (g_fps || !g_win) return;
+    NSView *cv = g_win.contentView;
+    NSTextField *l = g_fps = [NSTextField labelWithString:@"-- fps"];
+    l.font = [NSFont monospacedDigitSystemFontOfSize:12 weight:NSFontWeightSemibold]; l.textColor = NSColor.whiteColor;
+    l.drawsBackground = YES; l.backgroundColor = [NSColor colorWithWhite:0 alpha:0.5]; l.wantsLayer = YES; l.layer.cornerRadius = 5; l.layer.masksToBounds = YES;
+    l.frame = NSMakeRect(8, cv.bounds.size.height - 8 - 18, 240, 18); l.autoresizingMask = NSViewMinYMargin;   // stays at the top left when the window resizes
+    [cv addSubview:l];
+    double gap, gpu; mtl_frame_stats(&gap, &gpu);   // starts the spans now
+    __block uint64_t n0 = mtl_present_count(); __block double t0 = CACurrentMediaTime();
+    g_fps_timer = [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *t) {
+        (void)t; uint64_t n = mtl_present_count(); double now = CACurrentMediaTime(), gap, gpu; mtl_frame_stats(&gap, &gpu);
+        if (now - t0 < 1.5) {
+            NSString *s = [NSString stringWithFormat:@" %.0f fps · max %.0f ms", (n - n0) / (now - t0), gap];
+            if (gpu >= 0) s = [s stringByAppendingFormat:@" · GPU %.1f ms", gpu];
+            l.stringValue = s; [l sizeToFit]; NSRect f = l.frame; f.size.width += 6; f.origin.y = cv.bounds.size.height - 8 - f.size.height; l.frame = f;
+        }
+        n0 = n; t0 = now;
+    }];
+    LOG("front end: frame-rate counter on");
+}
+@interface DmFpsItem : NSObject @end
+@implementation DmFpsItem
+- (void)toggle:(NSMenuItem *)i { fps_show(!g_fps); i.state = g_fps ? NSControlStateValueOn : NSControlStateValueOff; }
+@end
+
 // AppKit reports a refused fullscreen request only to the window delegate (there is no notification for it)
 static void (^g_fs_failed)(void);
 @interface DmWinDelegate : NSObject <NSWindowDelegate> @end
@@ -1623,7 +1656,10 @@ void front_run(void (*guest)(void)) {
             dispatch_async(dispatch_get_main_queue(), ^{ [g_cheats_menu showPanel:nil]; });
         [[bar addItemWithTitle:@"Window" action:nil keyEquivalent:@""] setSubmenu:wm];
         [wm addItemWithTitle:@"Enter Full Screen" action:@selector(toggleFullScreen:) keyEquivalent:@"f"].keyEquivalentModifierMask = NSEventModifierFlagControl | NSEventModifierFlagCommand;
+        static DmFpsItem *fps_target; fps_target = [DmFpsItem new];
+        NSMenuItem *fps_item = [wm addItemWithTitle:@"Frame-Rate Counter" action:@selector(toggle:) keyEquivalent:@""]; fps_item.target = fps_target;
         NSApp.mainMenu = bar;
+        { const char *e = getenv("DM_SHOW_FPS"); if (e && atoi(e)) { fps_show(YES); fps_item.state = NSControlStateValueOn; } }
         const char *fs = getenv("DM_FULLSCREEN");   // 1 (or any value but 0): start in fullscreen; 0, the settings window's Window, or unset: a window
         if (fs && strcmp(fs, "0")) {
             // A game opened from a fullscreen app starts while macOS leaves that Space. Wait for activation and for the window to reach the active Space before asking for fullscreen
