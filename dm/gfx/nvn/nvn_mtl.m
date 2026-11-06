@@ -17107,7 +17107,7 @@ void mtl_exec(const uint8_t *p) {
 }
 
 // ---------- Present: draw the swapchain texture to the CAMetalLayer; optional screenshot ----------
-static id<MTLRenderPipelineState> g_blit_pso; static MTLPixelFormat g_blit_fmt;
+static id<MTLRenderPipelineState> g_blit_pso, g_easu_pso; static MTLPixelFormat g_blit_fmt;
 static id<MTLSamplerState> g_blit_samp;
 static uint64_t g_present_n;
 uint64_t mtl_present_count(void) { return g_present_n; }   // Actual present count (heat attribution DM_HEAT computes the present frame rate)
@@ -17163,7 +17163,7 @@ static pthread_mutex_t g_shotq_mu = PTHREAD_MUTEX_INITIALIZER;
 static int present_encode(id<MTLCommandBuffer> cb, id<MTLTexture> src, id<MTLTexture> dst, const int crop[4]);
 static int present_crop_rect(id<MTLTexture> src, const int crop[4], NSUInteger r[4]);
 enum { PRESENT_FAILED, PRESENT_STANDARD, PRESENT_METALFX, PRESENT_METALFX_SNAP };   // METALFX_SNAP: the picture was scaled at the snapshot (snap_take) and the present drew it 1:1
-static int present_draw_m4(id<MTL4CommandBuffer> cb, id<MTLTexture> tex, const NSUInteger r[4], MTLViewport vp, id<MTLTexture> dst, id<MTLBuffer> uvb, int full, float mode, float knee, float target);
+static int present_draw_m4(id<MTL4CommandBuffer> cb, id<MTLTexture> tex, const NSUInteger r[4], MTLViewport vp, id<MTLTexture> dst, id<MTLBuffer> uvb, int full, float mode, float knee, float target, int easu);
 static int present_offscreen_m4(id<MTLTexture> src, const int crop[4], id<MTLTexture> out, void (^done)(int));
 static int present_offscreen_wait(id<MTLTexture> src, const int crop[4], id<MTLTexture> out);
 // Game picture needed by the whole-window screenshot (front end window_shot; no longer does drawViewHierarchy on a Metal layer with the display link attached): at the next present, the present thread draws the same frame
@@ -17620,6 +17620,9 @@ static void present_pipeline(MTLPixelFormat format) {
         pd.colorAttachments[0].pixelFormat = format;
         g_blit_pso = [g_dev newRenderPipelineStateWithDescriptor:pd error:&e];
         if (!g_blit_pso) MDIE("present pipeline failed %s", e.localizedDescription.UTF8String);
+        pd.fragmentFunction = [lib newFunctionWithName:@"easu"];
+        g_easu_pso = [g_dev newRenderPipelineStateWithDescriptor:pd error:&e];
+        if (!g_easu_pso) MLOG("[RED] present FSR 1 pipeline failed (%s); DM_PRESENT_UPSCALE=fsr scales bilinearly", e.localizedDescription.UTF8String);
         g_blit_fmt = format;
         MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new]; sd.minFilter = sd.magFilter = MTLSamplerMinMagFilterLinear; sd.supportArgumentBuffers = YES;
         g_blit_samp = [g_dev newSamplerStateWithDescriptor:sd];
@@ -17748,18 +17751,21 @@ static id<MTL4Compiler> g_fx_comp;
 // floor clock, 1 ms at 850 MHz; Breath of the Wild's 13 ms frames then took 17–19 ms, docs/reference/frame-rate.md). DM_PRESENT_UPSCALE=ab (with DM_AB) alternates it with the
 // bilinear pass per phase, so one run shows the cost (sw_mode; the [ab] line names PRESENT_UPSCALE). The decision is read per present (fx_on), on the display-link thread
 static int g_fx_mode = -1;   // 1 = metalfx, 0 = off, 2 + ... = ab (sw_mode)
+static int g_fsr;   // DM_PRESENT_UPSCALE=fsr: FSR 1's edge adaptive upsampling in the present pass (fsr_on); MetalFX stays off then
 static int fx_mode(void) {
     if (g_fx_mode >= 0) return g_fx_mode;
     const char *e = getenv("DM_PRESENT_UPSCALE"); int v = 0;
     if (e && !strncmp(e, "ab", 2)) v = sw_mode("DM_PRESENT_UPSCALE", 0);
     else if (e && (!strcmp(e, "metalfx") || !strcmp(e, "1"))) v = 1;
+    else if (e && !strcmp(e, "fsr")) { g_fsr = 1; MLOG("present upscaling (DM_PRESENT_UPSCALE): fsr, FSR 1's edge adaptive upsampling in the present pass where the picture is shown larger than the game renders it"); return g_fx_mode = 0; }
     else if (e && (!strcmp(e, "off") || !strcmp(e, "0"))) v = 0;
-    else if (e && *e) MLOG("[RED] DM_PRESENT_UPSCALE=%s: metalfx, off or ab; keeping %s", e, v ? "metalfx" : "off");
+    else if (e && *e) MLOG("[RED] DM_PRESENT_UPSCALE=%s: metalfx, fsr, off or ab; keeping %s", e, v ? "metalfx" : "off");
     if (v && !(g_q4 && [MTLFXSpatialScalerDescriptor supportsMetal4FX:g_dev])) { MLOG("present upscaling: this GPU has no Metal 4 MetalFX spatial scaler; the present scales bilinearly"); v = 0; }
     MLOG("present upscaling (DM_PRESENT_UPSCALE): %s", v == 1 ? "metalfx, MetalFX's spatial scaler where the picture is shown larger than the game renders it" : v ? "metalfx in the DM_AB phases that have it on, bilinear in the others" : "off, bilinear");
     return g_fx_mode = v;
 }
 static int fx_on(void) { return sw_on(fx_mode()); }
+static int fsr_on(void) { (void)fx_mode(); return g_fsr; }
 // The present command buffer's GPU time by the game's present number (hle_nvn.c @present_gpu_ms, 8 presents late like @presented_ms); written in the commit feedback under g_pq_mu
 typedef struct { uint64_t n; float ms; } pres_gpu_ent;
 static pres_gpu_ent g_pres_gpu[PRING];
@@ -18114,11 +18120,13 @@ static int present_encode_m4(id<MTL4CommandBuffer> cb, id<MTLTexture> src, id<MT
              !direct_ok ? "DM_FX_DIRECT=0" : !full ? "the picture does not fill it" : flipped ? "the lower-left origin flips it" : mode != 0.0f ? "the pass converts it for the target" : "the scaler cannot write it",
              (unsigned long)dst.width, (unsigned long)dst.height, (unsigned long)dst.pixelFormat, (unsigned long)dst.usage, (unsigned long)up.width, (unsigned long)up.height); }
     if (up) { tex = up; r[0] = r[1] = 0; r[2] = up.width; r[3] = up.height; }   // the scaled picture, the viewport's size: drawn 1:1
-    if (!present_draw_m4(cb, tex, r, vp, dst, uvb, full, mode, knee, target)) return 0;
-    return up ? PRESENT_METALFX : PRESENT_STANDARD;
+    // FSR 1 upscales in the pass itself (DM_PRESENT_UPSCALE=fsr), for a picture drawn as stored: one the pass converts for its target (mode, the HDR output) takes the bilinear pass
+    int easu = !up && fx && g_easu_pso && fsr_on() && mode == 0.0f && fx_wanted(vp, r[2], r[3]);
+    if (!present_draw_m4(cb, tex, r, vp, dst, uvb, full, mode, knee, target, easu)) return 0;
+    return up || easu ? PRESENT_METALFX : PRESENT_STANDARD;
 }
 // The present pass itself: tex's rectangle r drawn into vp of dst (full: vp covers dst). A ring slot's picture scaled at the snapshot (snap_take) is drawn through this alone, 1:1
-static int present_draw_m4(id<MTL4CommandBuffer> cb, id<MTLTexture> tex, const NSUInteger r[4], MTLViewport vp, id<MTLTexture> dst, id<MTLBuffer> uvb, int full, float mode, float knee, float target) {
+static int present_draw_m4(id<MTL4CommandBuffer> cb, id<MTLTexture> tex, const NSUInteger r[4], MTLViewport vp, id<MTLTexture> dst, id<MTLBuffer> uvb, int full, float mode, float knee, float target, int easu) {
     MTL4RenderPassDescriptor *rp = [MTL4RenderPassDescriptor new];
     rp.colorAttachments[0].texture = dst;
     rp.colorAttachments[0].loadAction = full ? MTLLoadActionDontCare : MTLLoadActionClear;
@@ -18136,7 +18144,7 @@ static int present_draw_m4(id<MTL4CommandBuffer> cb, id<MTLTexture> tex, const N
     uv[8] = mode; uv[9] = present_white(mode); uv[10] = knee; uv[11] = target;   // mode, knee, target: the conversion for the target (present_encode_m4)
     if (atomic_load_explicit(&g_origin_ll, memory_order_relaxed)) { uv[1] += uv[3]; uv[3] = -uv[3]; }   // lower-left origin: the window image is stored bottom-up
     [g_present_args setAddress:uvb.gpuAddress atIndex:0];
-    [en setViewport:vp]; [en setRenderPipelineState:g_blit_pso];
+    [en setViewport:vp]; [en setRenderPipelineState:easu ? g_easu_pso : g_blit_pso];
     [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     m4_end(en);
     return 1;
@@ -18180,7 +18188,7 @@ static void present_gpu_note(double s, int fx) {   // fx: 0 bilinear, 1 MetalFX 
     v[fx][n[fx]++] = s * 1e3;
     if (n[fx] < 600) return;
     double *a = v[fx]; for (int i = 1; i < 600; i++) { double x = a[i]; int j = i - 1; while (j >= 0 && a[j] > x) { a[j + 1] = a[j]; j--; } a[j + 1] = x; }
-    MLOG("present command buffer GPU time over 600 presents %s: p50 %.3f ms, p95 %.3f ms, max %.3f ms", how[fx], a[299], a[569], a[599]);
+    MLOG("present command buffer GPU time over 600 presents %s: p50 %.3f ms, p95 %.3f ms, max %.3f ms", fx == 1 && fsr_on() ? "through FSR 1" : how[fx], a[299], a[569], a[599]);
     n[fx] = 0;
 }
 static double g_link_it_tin;   // Enqueue time of the frame the display-link callback is presenting (read and written only on the display-link thread)
@@ -18316,7 +18324,7 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     if (snap_up_for(up_slot, up_gen, dr.texture.width, dr.texture.height, dr.texture.pixelFormat, &up, &upvp)) {   // scaled at the snapshot (snap_take): drawn 1:1, no scaler here
         NSUInteger r[4] = {0, 0, up.width, up.height}; present_pipeline(dr.texture.pixelFormat);
         int full = upvp.originX == 0 && upvp.originY == 0 && (NSUInteger)upvp.width == dr.texture.width && (NSUInteger)upvp.height == dr.texture.height;
-        kind = present_draw_m4(cb, up, r, upvp, dr.texture, g_present_uv[alloc_i], full, 0.0f, 0.0f, 0.0f) ? PRESENT_METALFX_SNAP : 0;   // as stored: snap_take scales only a picture that needs no conversion
+        kind = present_draw_m4(cb, up, r, upvp, dr.texture, g_present_uv[alloc_i], full, 0.0f, 0.0f, 0.0f, 0) ? PRESENT_METALFX_SNAP : 0;   // as stored: snap_take scales only a picture that needs no conversion
     } else {
         snap_up_stale(up_slot, up_gen);   // counts a picture scaled for another canvas: the present's own scaler this frame
         kind = present_encode_m4(cb, src, dr.texture, crop, g_present_uv[alloc_i], &g_fx_present);
