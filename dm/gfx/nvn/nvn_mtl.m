@@ -15187,6 +15187,9 @@ uint64_t mtl_geocomp_stats(char *out, size_t cap) {
     g_gcp_npair = 0; os_unfair_lock_unlock(&g_gcp_lk);
     return total;
 }
+// NVN2 task / mesh draws, and the draws dropped while their pipeline was still being built (mesh_tasks_draw): a dropped draw leaves its geometry out of the frame, while a
+// depth pre-pass drawn with a pipeline that was ready still writes its depth, so the two passes of one object can disagree for as long as the build takes
+void mtl_mtk_stats(uint64_t *n, uint64_t *wait) { *n = g_mtk_n; *wait = g_mtk_wait; }
 void mtl_geohoist_stats(uint64_t *moved, uint64_t *runs, uint64_t *stops) { *moved = g_geo_hoisted; *runs = g_geo_hoist_runs; memset(stops, 0, 6 * sizeof *stops); stops[3] = g_geo_dependency_splits; }
 void mtl_cshoist_stats(uint64_t *moved, uint64_t *depth, uint64_t *stops) { *moved = g_csh_moved; *depth = g_csh_depth; for (int i = 0; i < 8; i++) stops[i] = g_csh_stop[i]; }
 // Physical color attachments the selected pipeline can write. A merged pass remaps logical outputs and channel masks; a specialized fragment's outputs are unknown here.

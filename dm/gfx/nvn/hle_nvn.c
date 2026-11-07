@@ -2081,6 +2081,10 @@ static void power_line(uint64_t frame) {
         pmn = mn; pmw = mw; prd = rd; prn = rn; memcpy(pre, re, sizeof pre);
         uint64_t mtl_geocomp_stats(char *, size_t); char gc[768]; uint64_t gcn = mtl_geocomp_stats(gc, sizeof gc);   // why geometry draws took the compute path (nvn_geometry.inc GCP_*)
         if (gcn) LOG("[nvn] geometry compute path up to frame %llu: %s", frame, gc);
+        void mtl_mtk_stats(uint64_t *, uint64_t *); static uint64_t pkn, pkw; uint64_t kn, kw; mtl_mtk_stats(&kn, &kw);
+        if (kn != pkn || kw != pkw) LOG("%s[nvn] task / mesh draws up to frame %llu: %llu, and %llu dropped while their pipeline was still built (their geometry is out of the frame; a pre-pass whose pipeline was ready still wrote its depth)",
+            kw != pkw ? "[RED] " : "", frame, (unsigned long long)(kn - pkn), (unsigned long long)(kw - pkw));
+        pkn = kn; pkw = kw;
         void mtl_fb_stats(uint64_t *, uint64_t *, uint64_t *, uint64_t *); static uint64_t pfs, pfr, pft, pfw; uint64_t fs_, fr, ft, fw; mtl_fb_stats(&fs_, &fr, &ft, &fw);   // same-pass feedback (nvn_mtl.m fb_prepare)
         if (fs_ != pfs || fr != pfr || ft != pft) LOG("[nvn] same-pass feedback up to frame %llu, per frame: %.1f snapshots taken, %.1f draws reused one, %.1f read the tile (%.1f waited for their pipeline)",
             frame, (fs_ - pfs) / nf, (fr - pfr) / nf, (ft - pft) / nf, (fw - pfw) / nf);
