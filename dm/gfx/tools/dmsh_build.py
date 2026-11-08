@@ -663,6 +663,44 @@ def _ep_drop(x, ids):   # OpEntryPoint without the given interface IDs: model, f
     y[0] = len(y) << 16 | (x[0] & 0xffff)
     return y
 
+# A texel fetch past the edge of a sampled 2D texture reads the nearest texel inside. A game can fetch there by its own arithmetic: The Legend of Zelda: Ocarina of Time's ground mist
+# (5ad65c0eefd09c7f) projects each mist sample to the screen and fetches the half-resolution scene depth at x = uv * 768, uv not clamped, on a 768-wide texture (its constant c3[18]), so a sample
+# just past the picture's edge reads past the texture, by that arithmetic on the console as well. On an M4 Max Metal returns 0 there (t_fetch_clamp with the rewrite removed, float and depth
+# textures alike), the near plane under the game's depth test: every such sample counted as hidden, and the mist had a hard straight edge at the picture's left and right margins. Switch 2 footage
+# of the area shows no edge, so its GPU returns something else there. Open: which value (the nearest texel, the far plane or another), what a Switch 1 GPU returns, and whether the nearest texel
+# is right for the other reads this reaches (seen only for this mist). Only sampled 2D textures (Ryujinx's <stage>_t_ names, declared texture2d without an access qualifier or depth2d): images
+# (<stage>_i_, also declared texture2d when only read), arrays, 3D and multisampled textures keep Metal's result, as do the names in `keep` (the caller's: the 1D integer fetches the translator reads
+# as 2D rows, where a texture buffer may be bound, fetch1d_names), a texture reached through another expression than a name or a member chain, and a read inside another read's coordinate.
+# Both searches start with a literal (the call, read back to its texture; the declarations): a pattern without one tries every position of a multi-megabyte shader (dmsh_fetch.py, _once).
+def fetch_clamp(msl, keep=()):
+    if '.read(uint2(' not in msl: return msl
+    decl = (m for p in (r'texture2d<(?:float|int|uint)>\s+(\w+)', r'depth2d<float>\s+(\w+)') for m in re.finditer(p, msl))   # literal starts, a word boundary checked by hand
+    plain = {m.group(1) for m in decl if not (m.start() and (msl[m.start() - 1].isalnum() or msl[m.start() - 1] == '_')) and re.match(r'[a-z]+_t_', m.group(1)) and m.group(1) not in keep}
+    out, at, k = [], 0, msl.find('.read(uint2(')
+    while k >= 0:
+        m = re.search(r'(?<![\w.>\])])((?:\w+\.)*(\w+))\Z', msl[max(0, k - 256):k])   # the texture: a name, or a member chain ending in it
+        if m and m.group(2) in plain and k - len(m.group(1)) >= at:
+            i, depth, comma = k + len('.read('), 0, None
+            for j in range(i, len(msl)):
+                c = msl[j]
+                if c in '([': depth += 1
+                elif c == ']' or (c == ')' and depth > 0): depth -= 1
+                elif c == ')': end = j; break
+                elif c == ',' and depth == 0 and comma is None: comma = j
+            else: raise ValueError('texel fetch: call not closed')
+            coord = msl[i:comma if comma is not None else end].strip()
+            lod = msl[comma + 1:end].strip() if comma is not None else '0'
+            t = m.group(1)
+            out += [msl[at:i], f'uint2(clamp(int2({coord}), int2(0), int2({t}.get_width(uint({lod})), {t}.get_height(uint({lod}))) - 1)), {lod}']
+            at = end
+        k = msl.find('.read(uint2(', k + 1)
+    return ''.join(out) + msl[at:]
+
+def fetch1d_names(msl, res):
+    """The 2D texture names whose slot the translator reads by 1D integer fetches as 2D rows (res "fetch1d", Program.cs RecordTexelFetch1D; a texture buffer may be bound there): fetch_clamp keeps them"""
+    f1 = set(res.get('fetch1d', ()))
+    return {nm for nm in re.findall(r'\btexture2d<\w+>\s+(\w+)', msl) if (dmsh_reflect.decode_tex(nm) or (None,))[0] in f1} if f1 else set()
+
 def geometry_finish(key, w, j, c1):
     """Build all five input-topology variants; the draw selects one at replay.
     Resources retain logical NVN stage 2 even though Metal executes a kernel.
@@ -682,9 +720,9 @@ def geometry_finish(key, w, j, c1):
         if r.returncode: return 'geometry MSL failed', r.stderr.strip()[:160], None
         try: selected = dmsh_fetch.select_guards(dmsh_rewrite.loop_guard(dmsh_rewrite.precise(dmsh_atomic.check_msl(r.stdout))))   # bounded uniform reads as selects (see dmsh_fetch.select_guards)
         except ValueError as e: return 'geometry MSL failed', str(e)[:160], None
-        plain = dmsh_geometry.topology_pointer(dmsh_reflect.pool_arrays(selected))
-        src = dmsh_geometry.capture_input(plain)
         res = json.load(open(os.path.join(w, k + '.res.json')))
+        plain = dmsh_geometry.topology_pointer(dmsh_reflect.pool_arrays(fetch_clamp(selected, fetch1d_names(selected, res))))   # as finish: see fetch_clamp
+        src = dmsh_geometry.capture_input(plain)
         refl = {'key': key + '_bg' + str(t), 'route': 'B', 'chain': CHAIN, 'dm_ctl': key,
                 'source': f'{loc[key][0]}#{loc[key][1]}', 'pc_paired': pc_of[key], 'stage': 'gs',
                 'entry': 'main0', 'msl_entry_kind': 'kernel', 'threadgroup_size': [32, 1, 1],
@@ -758,6 +796,9 @@ def finish(key, w, j, c1):
     try: src = dmsh_fetch.select_guards(src)   # bounded uniform reads as a load and a select, as the translator means them, not a branch for each (see dmsh_fetch.select_guards)
     except ValueError as e: return 'uniform bounds rewrite failed', str(e)[:160], None
     src = dmsh_rewrite.mul_extended(src)   # scalar extended products without the optnone wrapper (see mul_extended)
+    res = json.load(open(os.path.join(w, key + '.res.json')))
+    try: src = fetch_clamp(src, fetch1d_names(src, res))   # texel fetches past the edge of a sampled 2D texture (see fetch_clamp)
+    except ValueError as e: return 'texel fetch clamp failed', str(e)[:160], None
     try: src = dmsh_rewrite.gather_offsets(src)   # four gathers instead of a wrapper's loop over their offsets (see gather_offsets)
     except ValueError as e: return 'gather offsets rewrite failed', str(e)[:160], None
     src = dmsh_rewrite.loop_guard(src)   # no loop can run forever (see dmsh_rewrite.loop_guard)
@@ -792,7 +833,6 @@ def finish(key, w, j, c1):
         src, pad = vs_pad(key, src)
         if pad: open(msl, 'w').write(src)
     lay = None; discard = False
-    res = json.load(open(os.path.join(w, key + '.res.json')))
     if j['stage'] == 'vs':   # the two depth-convention entry points (see vs_depth); the analysis below uses the source with only main0
         capture = dmsh_geometry.capture(src)
         src, full = dmsh_entry.vs_depth(src)
