@@ -289,6 +289,13 @@
 - **Fix:** `dm/tools/shader_cache.py`: a write or a commit that fails fails its whole batch, which is rolled back with `full` set, and no write is tried after that (one inside the ended transaction would land on its own). The outermost batch is tracked by the store, not by SQLite's transaction flag, which the failed write cleared. `commit` removes its files only once the batch has committed and `full` is still clear; otherwise every file stays on disk, where `publish_library` takes it. A forked worker's store (`Remote`) has `full` from the end of its batch. `dm/tools/tests/test_shader_cache.py` fills a store with a page limit inside a batch and fails a commit; `test_shader_toolchain_cache.py` stages a shader into a full store and publishes it.
 - **Found on:** a code audit's reproduction with a page-limited SQLite file (2026-11-13); no build has been seen to lose an output.
 
+### A Mac app packed with the library's image names it `b-<chain>.img.img`
+
+- **Symptom:** the Mac app logs `[RED] shader library …/Contents/Resources/msl/b-<chain> (a folder or a .img file) does not exist` and then `failed to load shader` for its shaders. Its `msl/` holds `b-<chain>.img.img`, and its `Info.plist` has `DMChain` `<chain>.img`.
+- **Cause:** `pack_app.py --msl` takes a library as its folder or as its image (`shader_lib.py`), but named the app's copy after the path it was given. An image path kept its `.img`, and `copy_msl` writes the copy as `<name>.img`. The NSP script passes the folder's path, so only a hand-run `pack_app.py` given `shader/cache/b-<chain>.img` met it.
+- **Fix:** `dm/mac/pack_app.py` names the copy by `shader_lib.name_of`, as `is_chain_library` already reads it, for the first program and for the others (`--program`). `--msl-name` still sets another name.
+- **Found on:** [Ocarina of Time](../../dm/games/0400486024DEC000/README.md), a Mac app packed by hand from the build's `shader/cache/b-<chain>.img`. `test_nsp_mac_app.py` packs a library given as its image.
+
 ### A work folder holds millions of small files
 
 - **Symptom:** a game's `<id>-work` folder is too slow to count: Tears of the Kingdom's held 8,893,028 files and 509 GB, and its count ran past ten minutes.
