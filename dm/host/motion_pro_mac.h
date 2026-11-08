@@ -40,6 +40,9 @@ static void pro_report(void *ctx, IOReturn result, void *sender, IOHIDReportType
     pro_motion_sample samples[3];
     int n = pro_motion_decode(&d->motion, r, (size_t)len, now_ns(), samples);
     for (int i = 0; i < n; i++) dm_motion_set_hid(g_pro_player, samples[i].acc, samples[i].rot, samples[i].ns);
+    if (d->motion.bias_set && !d->motion.bias_logged) { d->motion.bias_logged = 1;
+        LOG("[hid] Pro Controller raw motion: gyro zero learned from a second at rest: %.2f %.2f %.2f deg/s (taken off every sample from here; relearned at the next rest)",
+            d->motion.bias[0] * 180 / M_PI, d->motion.bias[1] * 180 / M_PI, d->motion.bias[2] * 180 / M_PI); }
 }
 static void pro_found(void *ctx, IOReturn result, void *sender, IOHIDDeviceRef hid) {
     (void)ctx; (void)sender;
