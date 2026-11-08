@@ -22,6 +22,7 @@
 #include "haptics_apple.h"
 #include "motion_apple.h"
 #include "motion_pro_mac.h"
+#include "motion_imu_mac.h"
 #include "pad_apple.h"
 #include "pad_hid_mac.h"
 #include "pad_switch2_apple.h"
@@ -277,6 +278,12 @@ static void pro_players_changed(GCController *gone) {
         count++; player = g_merge ? 0 : pad_slot_of(&g_slots, (__bridge const void *)c);
     }
     dm_motion_pro_players(count, player);
+    // Pads GameController adopts without a gyro whose HID reports carry one (motion_imu_mac.h): counted by name, as only an unmatched pair is ambiguous
+    count = 0; player = -1;
+    for (GCController *c in GCController.controllers) if (c != gone && c.extendedGamepad && !c.motion.hasRotationRate && imu_profile_named(pad_name(c))) {
+        count++; player = g_merge ? 0 : pad_slot_of(&g_slots, (__bridge const void *)c);
+    }
+    dm_motion_imu_players(count, player);
 }
 static void pro_devices_changed(void) { pro_players_changed(nil); }
 // DM_PAD_PRESS_TO_JOIN=1: a controller is no player until one of its buttons is pressed, then it is the lowest player free, as a console's "press a button" screen.
@@ -376,7 +383,7 @@ static void input_release(void) {
     [NSCursor setHiddenUntilMouseMoves:NO];
     display_awake(0);
     g_input_on = 0;
-    dm_motion_pro_active(0); hidpad_motion_clear();
+    dm_motion_pro_active(0); dm_motion_imu_active(0); hidpad_motion_clear();
     dm_switch2_active(0);
     kbd_release();
     if (g_mouse_down) { g_mouse_down = 0; dm_touch_set(NULL, 0); }
@@ -385,7 +392,7 @@ static void input_release(void) {
 static void input_resume(void) {
     display_awake(1);
     g_input_on = 1;
-    dm_motion_pro_active(1);
+    dm_motion_pro_active(1); dm_motion_imu_active(1);
     dm_switch2_active(1);
     pads_reread();
 }
@@ -650,6 +657,7 @@ static void pads_start(void) {
     pads_changed(nil);
     hq_log_setting();
     dm_motion_pro_start(pro_devices_changed);
+    dm_motion_imu_start(pro_devices_changed);
     hidpad_start();
     static const dm_switch2_front s2front = {s2pad_attach, s2pad_detach, s2pad_read, s2pad_player, s2pad_blocked};
     dm_switch2_start(&s2front);
