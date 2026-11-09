@@ -25,6 +25,7 @@ DM_CHEATS	path	Folder of Atmosphère cheat files: `<folder>/<build ID>.txt` or a
 DM_CHEATS_ANY_BUILD	switch	`1` loads a cheat file written for another build of the game when it is the only one (its addresses may not fit: for `cheat_anchor.py` checks)
 DM_CHEATS_DEBUG	diagnostic	Logs every memory write a cheat makes and the cheat file context the menu's "another version" rows come from
 DM_CHEATS_ON	switch	Comma-separated cheat names turned on at launch, besides the saved per-build enabled states
+DM_CHEATS_UNDO	switch	`0` makes turning a cheat off leave what it wrote, as on a Switch (by default each cheat's undo log, kept in `<build ID>.undo`, puts back the values it changed)
 DM_CHEATS_WINDOW	switch	`1` opens the Mac Cheats panel beside the game from the start
 DM_CONTROLLER_WINDOW	switch	`1` opens the Mac Controller panel (the Switch 2 stick tester) beside the game from the start; the game gets no Switch 2 controller input until it is closed
 DM_CONTROLS_CAPTURE	test	`=<folder>`: `tests/t_controls_mac.m` also draws the Mac Controls panel's content into `controls-panel.png` there
