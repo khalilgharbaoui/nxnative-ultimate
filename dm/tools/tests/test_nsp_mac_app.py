@@ -120,7 +120,7 @@ class PackReuse(unittest.TestCase):
             'font/nintendo_ext.ttf': b'font', 'aoc/1/data': b'dlc', 'pso/gpu.mtl4a': b'archive',
             'pso/prebuilt.tsv': b'prebuilt', 'pso/rest_pairs.tsv': b'rest', 'pso/archive.tsv': b'index',
             'pso/gpu-prewarm-00.mtl4a': b'bases', 'pso/gpu-prewarm-00.keys': b'DMPSOIX1', 'pso/prewarm.tsv': b'stamp',   # --prebake's files and their index
-            'env.txt': b'DM_TEST=1', 'split.tsv': b'split', 'icon.jpg': b'jpeg', 'source/launcher.c': b'launcher',
+            'env.txt': b'DM_TEST=1', 'split.tsv': b'split', 'icon.jpg': b'jpeg', 'source/launcher.c': b'launcher', 'source/app_icon.swift': b'icon renderer',
             'host/romfs_image.h': b'validator', 'host/save_sync.c': b'sync', 'host/save_sync.h': b'sync api', 'host/save_archive.h': b'archive header', 'host/save_archive.c': b'archive', 'tools/romfs.py': b'reader',
             'source/Launcher.swift': b'window', 'ios/Sources/LauncherSettings.swift': b'model', 'ios/Sources/LauncherRow.swift': b'rows', 'ios/Sources/SaveSyncReport.swift': b'report',
             'ios/Sources/SaveData.swift': b'save data',
@@ -149,6 +149,9 @@ class PackReuse(unittest.TestCase):
                 if '--show-sdk-path' in cmd: return str(self.sdk) + '\n'
                 if '--show-sdk-version' in cmd: return self.sdk_version + '\n'
                 if 'clang' in cmd: name = 'clang'
+                if cmd[1] == 'swift':   # app_icon.swift: the iconset's PNGs
+                    if self.failed_tool == 'swift': raise SystemExit('fixture swift failed')
+                    s = Path(cmd[4]); s.mkdir(parents=True, exist_ok=True); (s / 'icon_16x16.png').write_bytes(b'png'); return ''
             if name in ('clang', 'swiftc'):
                 if '--version' in cmd: return (self.clang_version if name == 'clang' else self.swiftc_version) + '\n'
                 out = Path(cmd[cmd.index('-o') + 1]); out.write_bytes(b'fake ' + name.encode()); out.chmod(0o755); return ''
@@ -180,6 +183,21 @@ class PackReuse(unittest.TestCase):
         self.assertTrue(any('--sign' in c for c in self.commands))
         self.assertTrue(self.key.is_file())
 
+    def test_icon_as_is_is_the_given_art(self):   # --icon-as-is (the NSP script's --icon or --fallback-icon, the player's own artwork): sips sizes it, app_icon.swift never shapes it
+        self.args.icon_as_is = True
+        self.pack()
+        self.assertFalse(any(c[:2] == ['xcrun', 'swift'] for c in self.commands))
+        self.assertEqual(sum(c[0] == 'sips' for c in self.commands), 10)
+        self.assertEqual((Path(self.args.out) / 'Contents/Resources/AppIcon.icns').read_bytes(), b'icns')
+
+    def test_icon_without_swift_is_the_square_art(self):   # app_icon.swift cannot run: sips resizes the art, as before the rounded shape
+        self.pack()
+        self.assertFalse(any(c[0] == 'sips' for c in self.commands))
+        self.failed_tool = 'swift'; (self.tmp / 'icon.jpg').write_bytes(b'other jpeg')
+        self.assert_repacked()
+        self.assertEqual(sum(c[0] == 'sips' for c in self.commands), 10)
+        self.assertEqual((Path(self.args.out) / 'Contents/Resources/AppIcon.icns').read_bytes(), b'icns')
+
     def test_save_sync_choice_capability(self):
         self.args.settings = None
         info = pack_app.info_plist(self.args, '26.6', False)
@@ -207,7 +225,7 @@ class PackReuse(unittest.TestCase):
         self.pack()
         names = ['dmhost', 'patched/main.patched.bin', 'patched/main.fixups.tsv', 'patched/main.gates.tsv', 'patched/main.cuts.tsv',
                  'patched/main.obs.tsv', 'patched/nro.tsv', 'msl/k.metallib', 'msl/k.json', 'msl/inputs.tsv', 'font/nintendo_ext.ttf',
-                 'pso/gpu.mtl4a', 'pso/prebuilt.tsv', 'pso/rest_pairs.tsv', 'pso/archive.tsv', 'pso/gpu-prewarm-00.mtl4a', 'pso/gpu-prewarm-00.keys', 'pso/prewarm.tsv', 'env.txt', 'icon.jpg', 'source/launcher.c',
+                 'pso/gpu.mtl4a', 'pso/prebuilt.tsv', 'pso/rest_pairs.tsv', 'pso/archive.tsv', 'pso/gpu-prewarm-00.mtl4a', 'pso/gpu-prewarm-00.keys', 'pso/prewarm.tsv', 'env.txt', 'icon.jpg', 'source/launcher.c', 'source/app_icon.swift',
                  'source/Launcher.swift', 'ios/Sources/LauncherSettings.swift', 'ios/Sources/LauncherRow.swift', 'ios/Sources/SaveSyncReport.swift', 'ios/Sources/SaveData.swift',   # the settings window's sources
                  'host/save_sync.c', 'host/save_sync.h',   # the cloud-save code the launcher links (its send after the host exits)
                  'host/save_archive.c', 'host/save_archive.h']   # the save archive the window calls
@@ -556,6 +574,21 @@ class App(unittest.TestCase):
             a = types.SimpleNamespace(**vars(self.args)); a.out = str(d / "Metadata.app"); a.control_nacp = str(control)
             pack_app.pack(a)
             self.assertEqual((d / "Metadata.app/Contents/Resources/control.nacp").read_bytes(), bytes(0x4000))
+
+    def test_dev_app(self):   # a Mac-only build's run command starts the host inside it: the Dock shows the game's name and icon, with a DEV ribbon
+        out = self.tmp / 'run/Game - Test.app'; out.parent.mkdir(exist_ok=True)
+        for _ in range(2):   # made again over the last one
+            host = pack_app.dev_app(out, self.tmp / 'dmhost', 'Game: Test', TID, self.tmp / 'icon.jpg')
+        self.assertEqual(host, out / 'Contents/MacOS/dmhost')
+        self.assertEqual(host.read_bytes(), (self.tmp / 'dmhost').read_bytes())
+        self.assertFalse(out.with_name(out.name + '.partial').exists())
+        p = plistlib.loads((out / 'Contents/Info.plist').read_bytes())
+        self.assertEqual((p['CFBundleName'], p['CFBundleIdentifier'], p['CFBundleExecutable'], p['CFBundleIconFile']), ('Game: Test', 'org.nxnative.01008cf01baac000.dev', 'dmhost', 'AppIcon'))
+        self.assertEqual((out / 'Contents/Resources/AppIcon.icns').read_bytes()[:4], b'icns')
+        self.assertEqual(subprocess.run([host], env={'HOME': str(self.tmp / 'home')}, capture_output=True).returncode, 7)   # the stand-in host runs from inside the bundle
+        bare = pack_app.dev_app(self.tmp / 'run/No Icon.app', self.tmp / 'dmhost', 'No Icon', TID)
+        self.assertFalse((bare.parents[1] / 'Resources').exists())
+        self.assertNotIn('CFBundleIconFile', plistlib.loads((bare.parents[1] / 'Info.plist').read_bytes()))
 
     def test_pipeline_pair_tables(self):   # the pipeline prebuild reads them beside DM_NVN_SHMAP: without them it builds nothing, though every shader library is there
         dm = self.app / 'Contents/Resources/dm'

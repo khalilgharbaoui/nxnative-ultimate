@@ -5,7 +5,7 @@
 # aoc/<index>/ (DLC), pso/ (an NVN game's pipeline archive made offline for this Mac's GPU, dm/gfx/tools/pso_offline.py: the launcher hands it to the host as DM_PSO_BUNDLE),
 # and dm/ (the rewritten modules and their rewriter tables, nro.tsv, the profile's shader_map.tsv / pso_manifest.tsv / c1_full.tsv / cb_extent.tsv / shader_pairs.tsv / pso_pairs.tsv, font/, env.txt,
 # launcher.json: the game's launcher settings, dm/games/settings.py, which the settings window and Mac front ends show),
-# plus AppIcon.icns from the game's icon (sips, iconutil) and the Info.plist keys the launcher reads (DMTitleID, DMRomfsMarker, DMLanguage).
+# plus AppIcon.icns from the game's icon (app_icon.swift, in macOS's rounded-square shape; iconutil) and the Info.plist keys the launcher reads (DMTitleID, DMRomfsMarker, DMLanguage).
 # romfs.img, msl, aoc and pso are links into the signed data bundles in Contents/PlugIns that hold them (see Data bundles below), so that a pack which changes only the host signs in a second.
 # The large folders are APFS clones (cp -c) when the app is on the same APFS volume as the build, so they take no space; plain copies otherwise.
 # Signing: the new data bundles, the inner host, then the bundle (codesign --force --sign <identity>; '-' = ad-hoc), without the hardened runtime: the host maps the game's code executable, which the hardened
@@ -102,18 +102,43 @@ def build_launcher(out, minos, clang, swiftc, sdk):   # launcher.c's main and th
              '-o', out, *swift_sources(), *objs, '-framework', 'CoreFoundation', '-framework', 'AppKit', '-framework', 'SwiftUI', '-framework', 'GameController'])
 
 
-def make_icns(jpg, out):   # the game's icon (256x256 JPEG) at every size an .icns holds
+def make_icns(jpg, out, ribbon=None, shape=True):
+    """The game's icon (a 256x256 JPEG) at every size an .icns holds, in macOS's rounded-square shape (app_icon.swift); ribbon: a corner ribbon's text (a development build's DEV).
+    Where Swift cannot run, the square art resized by sips, as before. shape=False (--icon-as-is: the player's own artwork, the NSP script's --icon or --fallback-icon) packs the
+    image as it is given, resized by sips, with no shape and no ribbon"""
     with tempfile.TemporaryDirectory(dir=out.parent) as t:
-        s = Path(t) / 'AppIcon.iconset'; s.mkdir()
-        for n in ICON_SIZES:
-            for k, suffix in ((1, ''), (2, '@2x')):
-                run(['sips', '-s', 'format', 'png', '-z', n * k, n * k, jpg, '--out', s / f'icon_{n}x{n}{suffix}.png'])
+        s = Path(t) / 'AppIcon.iconset'
+        try:
+            if not shape: raise SystemExit('the icon is packed as given')
+            run(['xcrun', 'swift', HERE / 'app_icon.swift', jpg, s] + (['--ribbon', ribbon] if ribbon else []))
+        except (SystemExit, FileNotFoundError):   # run's failure, or no xcrun
+            shutil.rmtree(s, ignore_errors=True); s.mkdir()
+            for n in ICON_SIZES:
+                for k, suffix in ((1, ''), (2, '@2x')):
+                    run(['sips', '-s', 'format', 'png', '-z', n * k, n * k, jpg, '--out', s / f'icon_{n}x{n}{suffix}.png'])
         run(['iconutil', '-c', 'icns', s, '-o', out])
 
 
 # macOS shows this when a game first opens the microphone (SDK 21 / 22 input streams, hle_audio.c; DM_MIC=0 never opens it). TCC asks on behalf of the app that launched the host:
 # the packed app's launcher, or the terminal app when a shell starts the host
 MIC_USAGE = 'The game listens to the microphone where the console would, such as playing the ocarina by blowing or humming into it.'
+
+
+def dev_app(out, host, name, title_id, icon=None, icon_as_is=False):
+    """A Mac-only build's development app (build_ipa_from_nsp.py --platform mac): a bundle around a clone of the host, so the Dock and the app switcher show the game's name and icon,
+    with a DEV ribbon, instead of "dmhost". The run command starts the host inside it with the build's environment; it holds no game files. Returns the host inside the bundle"""
+    out = Path(out); tmp = out.with_name(out.name + '.partial')
+    shutil.rmtree(tmp, ignore_errors=True)
+    exe = tmp / 'Contents/MacOS' / Path(host).name
+    exe.parent.mkdir(parents=True)
+    if subprocess.run(['cp', '-c', host, exe], capture_output=True).returncode: shutil.copy2(host, exe)   # an APFS clone, else a copy
+    if icon: (tmp / 'Contents/Resources').mkdir(); make_icns(Path(icon), tmp / 'Contents/Resources/AppIcon.icns', ribbon='DEV', shape=not icon_as_is)
+    p = {'CFBundleName': name, 'CFBundleDisplayName': name, 'CFBundleIdentifier': f'org.nxnative.{title_id.lower()}.dev', 'CFBundleExecutable': exe.name,
+         'CFBundlePackageType': 'APPL', 'CFBundleInfoDictionaryVersion': '6.0', 'NSHighResolutionCapable': True, 'LSApplicationCategoryType': 'public.app-category.games', 'LSSupportsGameMode': False}
+    if icon: p['CFBundleIconFile'] = 'AppIcon'
+    (tmp / 'Contents/Info.plist').write_bytes(plistlib.dumps(p))
+    shutil.rmtree(out, ignore_errors=True); tmp.rename(out)   # a running game keeps its own host: the old bundle's files stay open until it quits
+    return out / 'Contents/MacOS' / exe.name
 
 
 def settings_rules(listed):   # DMSettings: what the launcher accepts as each setting's saved choice (docs/frontends.md, Saved choices)
@@ -336,7 +361,7 @@ def pack(a):
         if not codesign: raise SystemExit('codesign is not available')
         codesign = Path(codesign).resolve()
         minos = min_os(a.host)
-        sources = [Path(__file__).resolve(), HERE / 'launcher.c', HERE.parent / 'host/romfs_image.h', HERE.parent / 'host/save_sync.c', HERE.parent / 'host/save_sync.h', HERE.parent / 'host/save_archive.h', HERE.parent / 'host/save_archive.c', HERE.parent / 'tools/romfs.py'] + swift_sources()
+        sources = [Path(__file__).resolve(), HERE / 'launcher.c', HERE.parent / 'host/romfs_image.h', HERE.parent / 'host/save_sync.c', HERE.parent / 'host/save_sync.h', HERE.parent / 'host/save_archive.h', HERE.parent / 'host/save_archive.c', HERE.parent / 'tools/romfs.py', HERE / 'app_icon.swift'] + swift_sources()
         large = {*msls, *pso, *(p for x in programs for p in x[5])}   # the shader libraries and pipeline archives (13.5 GB for Ocarina of Time): by stat, as the RomFS trees below
         inputs = {'options': vars(a), 'files': [file_row(p, p in large) for p in files + sources],
                   'trees': [(p, inventory(Path(p))) for p in (a.romfs, a.aoc, a.html, *(str(x[1]) for x in programs), *(str(x[3]) for x in programs)) if p and Path(p).exists()],
@@ -410,7 +435,7 @@ def pack(a):
             rows.append('\t'.join([n, 'exe=@C@/MacOS/dmhost', f'arg=@R@/dm/p{n}', 'cwd=@S@', f'DM_ROMFS=@R@/{ptop}', f'DM_MSL_DIR=@R@/msl/p{n}', f'DM_NVN_SHMAP=@R@/dm/p{n}/shader_map.tsv', f'DM_PROGRAM={n}']))
         (dm / 'programs.tsv').write_text('\n'.join(rows) + '\n')
     icon = bool(a.icon)
-    if icon: step('icon'); make_icns(a.icon, res / 'AppIcon.icns')
+    if icon: step('icon'); make_icns(a.icon, res / 'AppIcon.icns', shape=not a.icon_as_is)
     info = info_plist(a, minos, icon)
     info['DMModuleFiles'] = [p.name for p in mods]
     commit = source_commit()
@@ -456,6 +481,7 @@ def parse(argv):
     ap.add_argument('--title-id', required=True); ap.add_argument('--name', required=True)
     ap.add_argument('--version'); ap.add_argument('--bundle-id'); ap.add_argument('--category'); ap.add_argument('--lang'); ap.add_argument('--marker', help='the profile\'s romfs_marker')
     ap.add_argument('--icon', help='the game icon (icon.jpg from the control data)')
+    ap.add_argument('--icon-as-is', action='store_true', help='pack --icon as it is given (the player\'s own artwork), not cut to macOS\'s rounded-square shape')
     ap.add_argument('--sign', default='-', help='codesign identity (default: - = ad-hoc)')
     return ap.parse_args(argv)
 
