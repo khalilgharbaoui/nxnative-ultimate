@@ -524,6 +524,13 @@ Most service calls can be found before they crash, before the first boot or the 
 - **Zero at rest:** without the pad's calibration the raw rate keeps the sensor's offset, tenths of a degree a second, and a game that aims by motion drifts steadily (Ocarina of Time: the camera turning slowly left). `motion_pro.h` takes the mean of a second of stillness (every axis under 2 °/s with a spread under 0.5 °/s, |acc| within 5 % of 1 G and steady) as the zero and subtracts it from every sample after, relearning it at the next rest; the log says the values once (`gyro zero learned from a second at rest`). A slow turn about the vertical that stays under 2 °/s for a whole second is learned too, and unlearned at the next rest: never a large error.
 - **Found on:** [Super Mario Galaxy](../../dm/games/010099C022B96000/README.md), docked pointer on a Pro Controller; the drift on [Ocarina of Time](../../dm/games/0400486024DEC000/README.md).
 
+### DualShock 4 over Bluetooth advertises motion but sends zeroes
+
+- **Symptom:** a DualShock 4 over Bluetooth is logged `with motion (gyro)` and the game reads the six-axis sensor every frame, but motion aiming does nothing; over USB it works (issue #1770). With `DM_MOTION_LOG=1` no `[hid] motion player 1` line appears.
+- **Cause:** as with the Pro Controller above, GameController's `GCMotion` for the pad sends only zeroes over Bluetooth, which `dm_motion_attach` rightly ignores. Its Bluetooth input report `0x11` carries the sensor.
+- **Fix:** the same passive reader (`motion_pro_mac.h`) also listens to vendor `054C`, products `05C4` and `09CC`, and `ds4_motion_decode` (`motion_pro.h`) reads report `0x11`: six signed little-endian words from byte 15, rotation x, y, z then acceleration, 8192 counts/G and 2000 deg/s over 32767, mapped to the Switch frame with the axes measured on a pad for MacNativeGames. One sample per report, stamped on arrival. Routing is the Pro Controller's: one physical pad and one GameController DualShock 4 or Pro, never two.
+- **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md), slingshot aiming with a DualShock 4 v1 (`05C4`) on macOS 27. `09CC` is matched by its identical Bluetooth report, not tested here.
+
 ### Identical controllers that GameController lists as one
 
 - **Symptom:** two Switch Pro Controllers connected over USB to a Mac play as one player: GameController lists one controller and reads one of the two pads, the other does nothing, and a two-player game refuses to start ([issue #1218](https://github.com/seedds/nxnative/issues/1218)). Over Bluetooth both are listed.
