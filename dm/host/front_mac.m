@@ -1777,6 +1777,9 @@ void front_run(void (*guest)(void)) {
         g_layer = [CAMetalLayer layer];
         g_layer.device = MTLCreateSystemDefaultDevice();
         g_layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+        // The SDR layer says its picture is sRGB: untagged, macOS takes it as the screen's own colour space. Fullscreen on a 4K HDR TV over HDMI in HDR mode, with nothing over the layer,
+        // showed a magenta band that came and went, gone with the menu bar shown or the screen mirrored, so on the path where the system shows the layer without compositing it
+        { CGColorSpaceRef srgb = CGColorSpaceCreateWithName(kCGColorSpaceSRGB); g_layer.colorspace = srgb; CGColorSpaceRelease(srgb); }
         // DM_HDR=1 (the HDR mode): an HDR layer whatever the window's screen, without HDR10 metadata unless DM_HDR_META=1 (front_hdr_metadata); a screen without headroom shows
         // the SDR range. The layer is RGB10A2 in BT.2100 PQ: the game's HDR10 window goes in as it is, an SDR source is encoded as HDR10 at the paper white (nvn_mtl.m
         // present_mode). Not an RGBA16Float extended linear layer, which showed black blocks on a MacBook Air M5 (docs/reference/rendering.md, the status query and the present for an HDR window)
