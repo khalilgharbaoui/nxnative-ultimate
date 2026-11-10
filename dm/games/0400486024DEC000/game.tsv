@@ -56,3 +56,6 @@ tex_dirty_upload	on
 # The game's compute dispatches with no barrier of its between them run side by side (nvn_mtl.m dispatch_enc): on the kokiri-deck route GPU p50 15.63 -> 14.76 ms (docked,
 # Apple M4 Pro, three runs a side), the pictures alike
 dispatch_overlap	on
+# The game submits a frame's commands behind an event its CPU signals once the frame before has left the GPU, so the GPU starts each frame with nothing queued and waits for the
+# replay: with Metal encoding on its own thread a GPU-bound Hyrule Field scene went 55.3-55.8 -> 56.5-56.9 fps (Apple M4 Pro, three runs a side, interleaved)
+enc_thread	on
