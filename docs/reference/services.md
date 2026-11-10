@@ -580,6 +580,13 @@ Most service calls can be found before they crash, before the first boot or the 
 - **Fix:** a raw HID pad is a player from its first button press, not from its connection (`hidpad_first_press`, `front_mac.m`), through the path of [Press a button to join](../settings.md#press-a-button-to-join) but with the slot a connecting controller takes (`pad_slot_take`): the log says `press a button to play`, then `a button pressed: player N`. A device that never presses takes no player. Identical pads read here (twins) are models GameController lists and stay players at their connection.
 - **Open:** not run with such a receiver (none here): the issue stays open for the reporter's retest. The applet opening in a loop when a one-player game sees two players was a cause of its own, resolved: [The controller applet leaves out the players past the maximum](#the-controller-applet-leaves-out-the-players-past-the-maximum).
 - **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md), a Keychron Link receiver (3434:d030) over USB and a Pro Controller over Bluetooth, macOS 27.0.1 ([issue #1657](https://github.com/seedds/nxnative/issues/1657)).
+### A HID pad whose sticks do not reach their range
+
+- **Symptom:** with a PowerA for Switch 2 (it pairs as "Lic3 Pro Controller" and is read through the HID path), a full push on a stick gives about two thirds of a full deflection: Ocarina of Time's Link walks where the keyboard's W makes him run.
+- **Cause:** the pad's sticks reach only X 8,400..56,464 and Y 3,823..58,943 of 0..65,535. Read as a share of the whole range, a full push is 0.66–0.71 after the 12 % dead zone.
+- **Fix:** `pad_hid.h` keeps the furthest deflection of each stick axis on each side since the pad connected (`reach`, from `PAD_HID_REACH0` 0.65; `pad_hid_set_axis` grows it), and `pad_hid_sticks` reads each axis as a share of its reach on that side before the dead zone. A pad that reaches its whole range reads as before after its first full push; triggers keep their range.
+- **Check:** `make -C dm/host/tests GAME=<id> build/t_pad_hid`, then `dm/host/tests/build/t_pad_hid`: the measured PowerA ends give full right and full up, a half push about half, the sides not pushed keep the start value, rest is 0. With the reach taken out of `pad_hid_sticks`, 3 of these fail.
+- **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md) with a PowerA for Switch 2 on the Mac: in 28 minutes recorded with `DM_REC`, the left stick read a full deflection (length ≥ 0.98) in 1,799 of 5,268 steps.
 
 ### SDK 20 six-axis sensor and amiibo (`nfp`) calls
 
