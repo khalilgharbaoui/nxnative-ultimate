@@ -361,6 +361,7 @@ bool dm_setting_live(const char *env, const char *value) {
         return true;
     }
     if (!strcmp(env, "DM_HDR")) { if (!dm_sdk_ounce()) return false; if (value) front_ios_hdr_live(atoi(value) != 0); return true; }   // Switch 2 games: the status query follows at once
+    if (!strcmp(env, "DM_VOLUME")) { if (value) { dm_audio_volume(atof(value)); LOG("front end: volume %s (in-game menu)", value); } return true; }
     if (!strcmp(env, "DM_SHOW_FPS")) { if (value) [g_root showFPS:atoi(value) != 0]; return true; }
     if (!strcmp(env, "DM_TOUCH_HAPTICS")) { if (value) dm_gamepad_touch_feedback(atoi(value) != 0); return true; }
     if (!strcmp(env, "DM_RUMBLE")) { if (value) { dm_haptics_set_enabled(atoi(value) != 0); LOG("front end: game rumble %s (in-game menu)", atoi(value) ? "on" : "off"); } return true; }
