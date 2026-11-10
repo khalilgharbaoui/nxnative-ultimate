@@ -18,6 +18,7 @@ void dm_pcmout_start(void *k) { (void)k; }
 int dm_pcmout_append(void *k, void *b) { (void)k; (void)b; return 0; }
 void *dm_pcmout_released(void *k) { (void)k; return NULL; }
 void dm_pcmout_wait(void *k, int ms) { (void)k; (void)ms; }
+int dm_audio_route(void) { return 2; }   // #2234: the renderer asks the output route; this test is the stereo limiter
 void hle_bind_system_event(void *ev, int ac) { (void)ev; (void)ac; }
 uint32_t hle_dup_readable_handle(uint32_t h) { return h; }
 
