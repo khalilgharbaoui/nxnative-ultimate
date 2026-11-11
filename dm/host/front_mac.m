@@ -5,7 +5,7 @@
 // Cheats (hle_cheats.c): the Cheats menu's rows toggle, reload (⌘R) and open the cheats folder; its first item "Show Cheats
 // Window" (⌘⇧C, or DM_CHEATS_WINDOW=1 at launch) opens a Cheats panel beside the game: sections, search, the master switch,
 // safe mode, values, details and the import of cheat files (see the code below).
-// Key map (Nintendo layout): WASD left stick, arrow keys D-pad (with Shift held: the right stick, for the camera), J=A K=B U=X I=Y, Q=L E=R, Z=ZL C=ZR, F=press left stick G=press right stick, Return=+ Tab=−, Space=shake the controller.
+// Key map (Nintendo layout; the table in keymap_mac.h, which the Controls panel lists: Window > Show Controls, ⌘K, or DM_SHOW_CONTROLS=1 at launch): WASD left stick, arrow keys D-pad (with Shift held: the right stick, for the camera), J=A K=B U=X I=Y, Q=L E=R, Z=ZL C=ZR, F=press left stick G=press right stick, Return=+ Tab=−, Space=shake the controller.
 // Controllers: face buttons as on the iPhone, by position (right A, bottom B, top X, left Y) or on a Nintendo pad by its labels (pad_apple.h), shoulders L R, triggers ZL ZR, Menu + Options −, both sticks and their presses.
 // Each controller is a player of its own (local co-op): the first one connected is player 1, together with the keyboard, the next player 2, and so on up to 8 (pad_slots.h);
 // DM_PAD_MERGE=1 merges every controller into player 1 instead, DM_KBD_PLAYER=own makes the keyboard player 1 on its own, with the controllers from player 2 on.
@@ -32,6 +32,7 @@ static void merge_rumble_to_s2(int on);
 #include "home_quit.h"
 #include "home_quit_mac.h"
 #include "ctrl_prompt.h"
+#include "controls_mac.h"
 #include <signal.h>
 #include <math.h>
 #include <sys/stat.h>
@@ -79,8 +80,8 @@ void front_hdr_content_range(unsigned lo, unsigned hi) {
     dispatch_async(dispatch_get_main_queue(), ^{ front_hdr_metadata(); });
 }
 static uint64_t g_btn;
-static int g_w, g_a, g_s, g_d;
-static int g_rl, g_ru, g_rr, g_rd;   // arrow keys pressed with Shift held: the right stick (each goes back up as it went down, whatever Shift does meanwhile)
+static int g_ls[KM_DIRS];   // the keys of the left stick held (WASD, keymap_mac.h), by direction
+static int g_rs[KM_DIRS];   // arrow keys pressed with Shift held: the right stick (each goes back up as it went down, whatever Shift does meanwhile)
 static int g_input_on = 1;   // main thread: the game window is key, so its keyboard, mouse and controllers reach the game (input_release / input_resume)
 
 void *front_metal_layer(void) { return (__bridge void *)g_layer; }
@@ -186,20 +187,12 @@ static void cursor_hide_for_input(void) {
     if (NSPointInRect([v convertPoint:g_win.mouseLocationOutsideOfEventStream fromView:nil], v.bounds)) [NSCursor setHiddenUntilMouseMoves:YES];
 }
 static void push(void) {
-    int32_t lx = (g_d - g_a) * 32767, ly = (g_w - g_s) * 32767;
-    int32_t rx = (g_rr - g_rl) * 32767, ry = (g_ru - g_rd) * 32767;
+    int32_t lx = (g_ls[KM_RIGHT] - g_ls[KM_LEFT]) * 32767, ly = (g_ls[KM_UP] - g_ls[KM_DOWN]) * 32767;
+    int32_t rx = (g_rs[KM_RIGHT] - g_rs[KM_LEFT]) * 32767, ry = (g_rs[KM_UP] - g_rs[KM_DOWN]) * 32767;
     dm_input_set(g_btn, lx, ly, rx, ry);
 }
-static int key_bit(unsigned short code) {
-    switch (code) {
-        case 38: return 0;  case 40: return 1;  case 32: return 2;  case 34: return 3;    // J K U I → A B X Y
-        case 3: return 4;   case 5: return 5;                                            // F G → press stick
-        case 12: return 6;  case 14: return 7;  case 6: return 8;   case 8: return 9;    // Q E Z C → L R ZL ZR
-        case 36: return 10; case 48: return 11;                                          // Return Tab → + −
-        case 123: return 12; case 126: return 13; case 124: return 14; case 125: return 15; // ← ↑ → ↓
-    }
-    return -1;
-}
+// Nothing the keyboard pressed stays pressed (focus lost, a prompt or the text box takes the input)
+static void kbd_release(void) { g_btn = 0; memset(g_ls, 0, sizeof g_ls); memset(g_rs, 0, sizeof g_rs); push(); }
 // fn held with a letter: the arrow and function keys carry the same modifier flag, so the key must be a letter for this to be a Globe shortcut
 static int fn_shortcut(NSEvent *e) {
     NSString *s = e.charactersIgnoringModifiers;
@@ -210,19 +203,19 @@ static int cp_poll(void);
 static void on_key(NSEvent *e, int down) {
     if (!g_input_on) return;
     unsigned short c = e.keyCode;
-    if (cp_blocks_input(g_cp.phase)) {   // the prompt has the keyboard: Return or J (A) is done, Escape or K (B) closes it, no key reaches the game
-        if (down && g_cp.phase == CP_OPEN) { if (c == 53 || c == 40) g_cp_cancel = 1; else if (c == 36 || c == 38) g_cp_confirm = 1; cp_poll(); }
+    if (cp_blocks_input(g_cp.phase)) {   // the prompt has the keyboard: Return or A's key (J) is done, Escape or B's key (K) closes it, no key reaches the game
+        if (down && g_cp.phase == CP_OPEN) { uint64_t b = km_button(c); if (c == 53 || b == DM_BTN_B) g_cp_cancel = 1; else if (c == 36 || b == DM_BTN_A) g_cp_confirm = 1; cp_poll(); }
         return;
     }
-    switch (c) { case 13: g_w = down; break; case 0: g_a = down; break; case 1: g_s = down; break; case 2: g_d = down; break; }
-    // An arrow key pressed with Shift held is the right stick until it is released; without Shift, the D-pad. The keyboard had no right stick: a 3D game's camera
-    // could be turned only with a controller (Donkey Kong Bananza)
-    int *rs = c == 123 ? &g_rl : c == 126 ? &g_ru : c == 124 ? &g_rr : c == 125 ? &g_rd : NULL;
-    if (rs && (down ? (e.modifierFlags & NSEventModifierFlagShift) != 0 : *rs)) { *rs = down; push(); return; }
-    int b = key_bit(c);
-    uint64_t m = b >= 0 ? 1ull << b : c == 49 ? DM_BTN_SHAKE : 0;   // Space: shaken while held
+    // The key map (keymap_mac.h): WASD moves the left stick; an arrow pressed with Shift held is the right stick until it is released, without Shift the D-pad;
+    // every other key of the map is a button (Space: the controller is shaken while it is held)
+    int ld = km_stick_dir(c, KM_LSTICK);
+    if (ld >= 0) g_ls[ld] = down;
+    int rd = km_stick_dir(c, KM_RSTICK);
+    if (rd >= 0 && (down ? (e.modifierFlags & NSEventModifierFlagShift) != 0 : g_rs[rd])) { g_rs[rd] = down; push(); return; }
+    uint64_t m = km_button(c);
     g_btn = down ? (g_btn | m) : (g_btn & ~m);
-    if (down && (m || c == 13 || c == 0 || c == 1 || c == 2)) cursor_hide_for_input();   // a key the game takes (WASD: the left stick)
+    if (down && (m || ld >= 0)) cursor_hide_for_input();   // a key the game takes
     push();
 }
 
@@ -381,7 +374,7 @@ static void input_release(void) {
     g_input_on = 0;
     dm_motion_pro_active(0); hidpad_motion_clear();
     dm_switch2_active(0);
-    g_btn = 0; g_w = g_a = g_s = g_d = 0; g_rl = g_ru = g_rr = g_rd = 0; push();
+    kbd_release();
     if (g_mouse_down) { g_mouse_down = 0; dm_touch_set(NULL, 0); }
     pads_release();
 }
@@ -624,7 +617,7 @@ int front_ctrl_support(int min, int max) {
     if (!g_layer) return -1;
     dispatch_semaphore_t done = dispatch_semaphore_create(0);
     dispatch_async(dispatch_get_main_queue(), ^{
-        g_btn = 0; g_w = g_a = g_s = g_d = 0; g_rl = g_ru = g_rr = g_rd = 0; push();   // nothing the game held stays pressed while the prompt has the input
+        kbd_release();   // nothing the game held stays pressed while the prompt has the input
         if (g_mouse_down) { g_mouse_down = 0; dm_touch_set(NULL, 0); }
         pads_release();
         int a, b; cp_buttons(&a, &b);
@@ -722,6 +715,69 @@ static void (^g_fs_failed)(void);
 @interface DmWinDelegate : NSObject <NSWindowDelegate> @end
 @implementation DmWinDelegate
 - (void)windowDidFailToEnterFullScreen:(NSWindow *)w { (void)w; if (g_fs_failed) g_fs_failed(); }
+@end
+
+// The Controls panel (Window > Show Controls, ⌘K, or DM_SHOW_CONTROLS=1 at launch; controls_mac.h builds it): the Switch controls and their keys from the key map
+// on_key reads, the touchscreen, the menu bar's shortcuts and a line on controllers. It floats beside the game window, at its left the first time (the Cheats panel
+// opens at its right) or over its top right corner when neither side has room on the screen, and stays where the player drags it (frame autosave "DmControlsPanel").
+// It never becomes key and is shown with orderFront, so the game keeps the keyboard and the controllers. Whether it is up is remembered in the user default
+// DmControlsPanel.shown, written only when the player shows or hides it (the menu item, the close button); DM_SHOW_CONTROLS=1 or 0 decides at launch instead
+static NSString *const kControlsShown = @"DmControlsPanel.shown";
+@interface DmControlsPanel : NSObject <NSWindowDelegate>
+@property (nonatomic, weak) NSMenuItem *item;   // Window > Show Controls, checked while the panel is up
+- (void)show;
+@end
+static DmControlsPanel *g_controls;   // made with the menu, kept for the process's lifetime
+@implementation DmControlsPanel {
+    NSPanel *_panel;   // made on the first show, kept for the process's lifetime
+    BOOL _shown;       // the player's choice: a panel hidden while another app is active (hidesOnDeactivate) still counts as shown
+}
+// The first place: beside the game window, its left side, then its right, else over the window's top right corner; on the window's screen
+- (void)place {
+    NSRect g = g_win.frame, f = _panel.frame, vis = (g_win.screen ?: NSScreen.mainScreen).visibleFrame;
+    f.origin = NSMakePoint(NSMinX(g) - 8 - f.size.width, NSMaxY(g) - f.size.height);
+    if (!NSContainsRect(vis, f)) f.origin.x = NSMaxX(g) + 8;
+    if (!NSContainsRect(vis, f)) {
+        NSRect c = [g_win contentRectForFrameRect:g];
+        f.origin = NSMakePoint(NSMaxX(c) - 12 - f.size.width, NSMaxY(c) - 12 - f.size.height);
+    }
+    [_panel setFrame:[_panel constrainFrameRect:f toScreen:g_win.screen] display:NO];
+}
+- (void)show {
+    if (!_panel) {
+        _panel = ctl_panel();
+        _panel.delegate = self;
+        ctl_panel_fill(_panel, ctl_rows(NSApp.mainMenu));
+        // The place the player left it at, else the first place; the autosave name is set after both, and from then on AppKit saves the panel's frame
+        BOOL kept = [_panel setFrameUsingName:@"DmControlsPanel"];
+        if (!kept && g_win) [self place];
+        _panel.frameAutosaveName = @"DmControlsPanel";
+        if (kept) ctl_panel_fill(_panel, ctl_rows(NSApp.mainMenu));   // at the size of its rows now
+        // the panel follows the game into and out of fullscreen: ordered front again once the window is on its Space (MoveToActiveSpace)
+        for (NSNotificationName nm in @[NSWindowDidEnterFullScreenNotification, NSWindowDidExitFullScreenNotification])
+            [NSNotificationCenter.defaultCenter addObserverForName:nm object:g_win queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) { (void)n; if (self->_shown) [self->_panel orderFront:nil]; }];
+    } else ctl_panel_fill(_panel, ctl_rows(NSApp.mainMenu));   // the menu's shortcuts as they are now
+    [_panel orderFront:nil];
+    _shown = YES; self.item.state = NSControlStateValueOn;
+    LOG("front end: controls panel shown (app active %d, game window key %d: the panel never takes the key window)", NSApp.isActive, g_win.isKeyWindow);
+}
+- (void)hide {
+    [_panel orderOut:nil];
+    _shown = NO; self.item.state = NSControlStateValueOff;
+    LOG("front end: controls panel hidden");
+}
+- (void)toggle:(NSMenuItem *)it {
+    (void)it;
+    if (_shown) [self hide]; else [self show];
+    [NSUserDefaults.standardUserDefaults setBool:_shown forKey:kControlsShown];
+}
+// The close button hides the panel (the object and its place stay) and is remembered as the menu's toggle is
+- (BOOL)windowShouldClose:(NSWindow *)w {
+    (void)w;
+    [self hide];
+    [NSUserDefaults.standardUserDefaults setBool:NO forKey:kControlsShown];
+    return NO;
+}
 @end
 
 typedef struct { void (*fn)(void); } guest_arg;
@@ -1775,7 +1831,16 @@ void front_run(void (*guest)(void)) {
         [wm addItemWithTitle:@"Enter Full Screen" action:@selector(toggleFullScreen:) keyEquivalent:@"f"].keyEquivalentModifierMask = NSEventModifierFlagControl | NSEventModifierFlagCommand;
         static DmFpsItem *fps_target; fps_target = [DmFpsItem new];
         NSMenuItem *fps_item = [wm addItemWithTitle:@"Frame-Rate Counter" action:@selector(toggle:) keyEquivalent:@""]; fps_item.target = fps_target;
+        // The Controls panel: ⌘K (a plain letter is a game key; ⌘Q, ⌘R, ⌘⇧C and ⌃⌘F are taken). DM_SHOW_CONTROLS=1 shows it at launch and 0 keeps it hidden;
+        // unset, it is as the player left it
+        g_controls = [DmControlsPanel new];
+        NSMenuItem *ctl_item = [wm addItemWithTitle:@"Show Controls" action:@selector(toggle:) keyEquivalent:@"k"]; ctl_item.target = g_controls; g_controls.item = ctl_item;
         NSApp.mainMenu = bar;
+        {
+            const char *e = getenv("DM_SHOW_CONTROLS");
+            BOOL up = e && *e ? atoi(e) != 0 : [NSUserDefaults.standardUserDefaults boolForKey:kControlsShown];
+            if (up) dispatch_async(dispatch_get_main_queue(), ^{ [g_controls show]; });   // after the menu is in place: the panel lists its shortcuts
+        }
         { const char *e = getenv("DM_SHOW_FPS"); if (e && atoi(e)) { fps_show(YES); fps_item.state = NSControlStateValueOn; } }
         const char *fs = getenv("DM_FULLSCREEN");   // 1 (or any value but 0): start in fullscreen; 0, the settings window's Window, or unset: a window
         if (fs && strcmp(fs, "0")) {
@@ -1891,7 +1956,7 @@ int front_text_input(const char *title, const char *sub, const char *guide, cons
     dispatch_sync(dispatch_get_main_queue(), ^{
         // The box takes the keyboard and the mouse, so the game window never sees the key-up of the button or the touch-up of the click that opened it: nothing may stay pressed
         // while it is up, or the game reads the stuck button / touch the moment the box closes (Stardew Valley's character creation re-opened the keyboard endlessly)
-        g_btn = 0; g_w = g_a = g_s = g_d = 0; g_rl = g_ru = g_rr = g_rd = 0; push();
+        kbd_release();
         dm_touch_set(NULL, 0);
         int min_chars = g_swkbd_min_chars > 0 ? g_swkbd_min_chars : 0;
         NSString *info = [NSString stringWithFormat:@"%s%s%s", sub ? sub : "", sub && *sub && guide && *guide ? "\n" : "", guide ? guide : ""];
