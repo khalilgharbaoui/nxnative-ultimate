@@ -102,7 +102,9 @@ def by_build(main_id):   # the profile whose build rows register this main build
 
 
 # agl's upscaler network (NDSR), by where the shader map found each key: the compute shaders of agl_ndsr.pck (Donkey Kong Bananza's 24 in its release library, Splatoon Raiders' 20 in its debug one)
-UPSCALER_SOURCE = re.compile(r'/agl_ndsr\.pck#')
+# and of its variants agl_ndsr_vr.pck and agl_ndsr_vr_light.pck: The Legend of Zelda: Ocarina of Time (Switch 2) upscales with agl_ndsr_vr.pck's, so DM_UPSCALER=metalfx left its network
+# running. A variant the host cannot draw (its colour, its rectangles) is refused there and runs as the game's (nvn_mtl.m up_mfx_wanted, up_mfx_encode)
+UPSCALER_SOURCE = re.compile(r'/agl_ndsr(?:_vr(?:_light)?)?\.pck#')
 
 
 def upscaler_keys(g):
@@ -193,6 +195,8 @@ def header_one(g):
     sko, skl = (int(m[1], 0), int(m[2], 0)) if m else (0, 0)
     rcd = g.get('render_cond', 'off')   # NVN conditional rendering evaluated at replay, timestamp reports with counter 0 (nvn_mtl.m OP_RENDER_COND): on / off
     if rcd not in ('on', 'off'): sys.exit(f'{g.id}: render_cond must be on or off: {rcd}')
+    dov = g.get('dispatch_overlap', 'off')   # the game's dispatches with no barrier of its between them run side by side in the copy encoder (nvn_mtl.m dispatch_enc; DM_NVN_DISPATCH_OVERLAP overrides): on / off
+    if dov not in ('on', 'off'): sys.exit(f'{g.id}: dispatch_overlap must be on or off: {dov}')
     tfu = g.get('tex_flush_upload', 'off')   # textures written by the CPU into a pool and published with nvnMemoryPoolFlushMappedRange are uploaded like packaged ones (hle_nvn.c): on / off
     if tfu not in ('on', 'off'): sys.exit(f'{g.id}: tex_flush_upload must be on or off: {tfu}')
     tdu = g.get('tex_dirty_upload', 'off')   # with tex_flush_upload: a registered texture the CPU writes after init without any flush is uploaded too (dirty pages, hle_nvn.c nvn_ft_written): on / off
@@ -206,6 +210,8 @@ def header_one(g):
     ups = upscaler_keys(g)   # the game's own upscaler shaders, which DM_UPSCALER=metalfx (the launcher's Game's upscaler) replaces with MetalFX's spatial scaler (nvn_mtl.m up_mfx_encode)
     dbr = g.get('draw_barriers', 'full')   # how draw passes are ordered (nvn_mtl.m barrier_game): full = each waits for all earlier GPU work, game = by the game's own barriers, so vertex work overlaps the previous pass's fragments
     if dbr not in ('full', 'game'): sys.exit(f'{g.id}: draw_barriers must be full or game: {dbr}')
+    tsh = g.get('gpu_ts_hz', '614400000')   # the counter timestamps' tick rate (nvn_timestamp.h): 614400000 (NVN), 31250000 for a Switch 2 game that reads raw reports at its system counter rate
+    if not tsh.isdigit() or int(tsh) <= 0: sys.exit(f'{g.id}: gpu_ts_hz must be a positive integer (Hz): {tsh}')
     om = g.get('op_mode', 'console')   # the operation mode reported at start (hle_oe.c dm_opmode; DM_OPMODE overrides): console = docked, handheld = touch screen in use (Super Mario Galaxy's pointer)
     if om not in ('console', 'handheld'): sys.exit(f'{g.id}: op_mode must be console or handheld: {om}')
     if pl == 'touch' and om != 'handheld': sys.exit(f'{g.id}: pad_layout touch needs op_mode handheld (the touch screen reaches the game only in handheld mode)')
@@ -257,9 +263,11 @@ def header_one(g):
          f'#define DM_GAME_TEX_FLUSH_UPLOAD {int(tfu == "on")}',
          f'#define DM_GAME_SHADER_KEY_SKIP_OFF {sko:#x}', f'#define DM_GAME_SHADER_KEY_SKIP_LEN {skl:#x}',
          f'#define DM_GAME_RENDER_COND {int(rcd == "on")}',
+         f'#define DM_GAME_DISPATCH_OVERLAP {int(dov == "on")}',
          f'#define DM_GAME_TEX_DIRTY_UPLOAD {int(tdu == "on")}',
          f'#define DM_GAME_TEX_DYN_SLOTS {int(tds == "on")}',
          f'#define DM_GAME_DRAW_BARRIERS_GAME {int(dbr == "game")}',
+         f'#define DM_GAME_GPU_TS_HZ {int(tsh)}ull',
          f'#define DM_GAME_UPSCALER_KEYS {q(",".join(ups))}', f'#define DM_GAME_UPSCALER_N {len(ups)}',
          f'#define DM_GAME_VCONV_RANGE {int(vcr == "on")}',
          *([f'#define DM_GAME_NVN_API_MAJOR {api.split(".")[0]}', f'#define DM_GAME_NVN_API_MINOR {api.split(".")[1]}'] if g.get('device_api', '') else []),   # without the key: by the SDK version (hle_nvn.c nvn_api)

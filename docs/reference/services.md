@@ -352,6 +352,34 @@ Most service calls can be found before they crash, before the first boot or the 
 - **Fix:** reject a non-finite sensor sample before priming or changing any state. A non-finite time step skips integration, and a non-finite gain disables tilt correction. Do not commit an overflowing rotation step or angle; normal finite samples keep the same arithmetic and coordinate conventions.
 - **Found on:** synthetic `t_motion` samples, not a reproduced game or controller fault. Tests cover each sensor axis before/after priming, subsequent valid input, invalid timing/gain, finite overflow, all 48 signed frame maps and small-angle accumulation. No device or gameplay result is claimed for this change.
 
+### Six-axis history at the sensor's 200 Hz
+
+- **Symptom:** with a Pro Controller 2 on a Mac, Breath of the Wild's motion aiming moved the view only until the right stick or a button was used; later, after a dead-zone fix, it worked for a whole aim or not at all, and while the controller turned the view stepped back and forth (flicker).
+- **Cause:** `GetSixAxisSensorStates` returned the newest sample in every history entry, numbered by time. The game's six-axis update (`main+0x10ff21c`, 1.9.0) takes the entries whose sampling numbers are new since its last read, so it saw one change and then equal entries; a Switch 2 controller reports every 30 ms on a Mac, against the console sensor's 5 ms. Filling the entries from the source's samples afresh at each read (turned on past the newest one) then showed the game a prediction and, a read later, the measurement that replaced it.
+- **Fix:** each source keeps its last 32 samples (`live_motion.hist`), and each handle has its own 200 Hz stream (`six_stream_fill` in `hle_hid.c`): sampling number n is the state of n - 1 moved on 5 ms (`motion_update`) at the rate and gravity the source shows at that time (`motion_at`: blended between two samples, the newest one's held past it). An entry the game may have read is never changed; the stream starts over when the source changes or starts over, or after 32 entries without a read. `DM_MOTION_STREAM=0` gives back the newest sample in every entry. `t_hid` checks distinct entries, 30 ms samples, a late sample that disagrees and the switch.
+- **Found on:** [Breath of the Wild](../../dm/games/01007EF00011E000/README.md) (1.9.0) with a Pro Controller 2 on a Mac: motion aiming on every aim with no flicker (reported by the player). Other motion sources (GameController, the phone, Joy-Con 2s, the Pro Controller's HID reports) go through the same stream; not rechecked on their games.
+
+### A Switch 2 controller's stick at rest off its centre
+
+- **Symptom:** a game reads a small constant deflection from a released stick some of the time; [Breath of the Wild](../../dm/games/01007EF00011E000/README.md) left motion aiming off for the whole aim when the right stick had come to rest that way.
+- **Cause:** the dead zone was 40 raw counts (about 3 % of the travel), and past it the output jumped to the full 40 counts' share. A Pro Controller 2's right stick came to rest 0 to 60 counts from its calibrated centre (raw y 2186 to 2211 between releases), so it read 0 or 3 to 5 % depending on the release.
+- **Fix:** `s2_cal_axis` takes a dead zone of a tenth of each side's travel (`S2_DEADZONE`, at least 40 counts) and scales the output from its edge, so it grows from 0. `DM_SW2_DEADZONE=<share>` (0 to 0.5) sets another; 0 keeps 40 counts without the jump. `t_switch2` checks a stick at rest off its centre and the edge.
+- **Found on:** [Breath of the Wild](../../dm/games/01007EF00011E000/README.md) (1.9.0), a Pro Controller 2 on a Mac. The console's own dead zone for these controllers is not measured; a tenth is the size the Switch 1 controllers' factory stick parameters give.
+
+### A Switch 2 controller waiting for its first press
+
+- **Symptom:** with *Press a button to join* on (`DM_PAD_PRESS_TO_JOIN=1`), a Switch 2 controller paired and connected, then the log said `no free player, not used` and `all players are taken`, and it disconnected before a button could be pressed.
+- **Cause:** the front end leaves a new pad without a player until its first press, and `attachPad` (`pad_switch2_apple.m`) read no player as every player taken.
+- **Fix:** the front end's `attach` returns whether it refused the pad (`pad_switch2_apple.h`); a pad waiting for its first press stays connected, and takes its npad's Joy-Con sides when it joins.
+- **Found on:** [Breath of the Wild](../../dm/games/01007EF00011E000/README.md) (1.9.0), a Pro Controller 2 on a Mac.
+
+### The Pro Controller 2's motion axes
+
+- **Symptom:** a Pro Controller 2 held in both hands read as rolled about 50 degrees to one side; pitching it turned into a roll.
+- **Cause:** its axis map was the Pro Controller 1's, borrowed without a measurement. Its raw frame is the Joy-Con 2 pair's (x right, y forward, z up): flat and still it read accel `-164,-584,4193`, held with its top tipped toward the screen `-73,3227,2597`.
+- **Fix:** `s2_map_pro` is the pair's map (`switch2_proto.h`); `t_switch2` checks both recorded poses. Its gyro scale is still the Joy-Con 2's, not measured on it. `scripts/sw2_gyro.sh` shows a controller's motion without a game.
+- **Found on:** [Breath of the Wild](../../dm/games/01007EF00011E000/README.md) (1.9.0), a Pro Controller 2 on a Mac.
+
 ### The phone's motion in the picture's frame
 
 - **Symptom:** on iPhone Duo's inner display the phone's gyro is turned a quarter turn: tilting up and down moves the pointer left and right, and the other way round ([GitHub issue #569](https://github.com/seedds/nxnative/issues/569)); the outer display is right.
@@ -367,7 +395,8 @@ Most service calls can be found before they crash, before the first boot or the 
 - **Fix:** `motion_pro_mac.h` listens nonexclusively to vendor `057E`, product `2009`, without sending commands or changing the driver's configuration. `motion_pro.h` converts the three signed little-endian samples to G and rad/s in the Switch frame; their nominal 5 ms spacing reaches the shared integrator through `dm_motion_set_hid`. Each HID device owns its buffer and decoder. HID, GameController and phone orientations stay separate; usable GameController data wins, otherwise fresh HID data supplies that player's controller motion. Removal, focus loss or ambiguous routing clears only the HID source; 300 ms of silence expires it. `DM_MOTION_HID=0` disables the reader; `DM_MOTION=0` disables all motion.
 - **Routing limit:** GameController exposes no public per-controller HID identity. Raw motion is enabled only with one physical Pro and one GameController Pro, using that controller's existing player slot (including `DM_KBD_PLAYER=own` / `DM_PAD_MERGE`). Multiple Pros keep their GameController paths; raw data is never assigned to the first controller by guesswork. Synthetic GameController HID devices are excluded with Apple's `GCSyntheticDevice` property.
 - **Open:** passive reading cannot obtain factory calibration without issuing SPI commands alongside the OS driver (identical pads read from their reports do issue that read, and it works: [Identical controllers that GameController lists as one](#identical-controllers-that-gamecontroller-lists-as-one)). Nominal scales are 4096 counts/G and 70 mdps/count ([protocol research](https://github.com/dekuNukem/Nintendo_Switch_Reverse_Engineering/blob/master/imu_sensor_notes.md)); no automatic bias learning removes slow intentional turns. Sample order follows that research and [Linux hid-nintendo](https://github.com/torvalds/linux/blob/master/drivers/hid/hid-nintendo.c); SDL reverses it. Confirm order, sensitivity, drift and reconnects on hardware before calling the reworked reader device-tested. `t_motion_pro`, `t_motion_pro_mac` and `t_hid` cover decoding, timestamps, ownership, removal, ambiguity and source fallback with synthetic inputs.
-- **Found on:** [Super Mario Galaxy](../../dm/games/010099C022B96000/README.md), docked pointer on a Pro Controller.
+- **Zero at rest:** without the pad's calibration the raw rate keeps the sensor's offset, tenths of a degree a second, and a game that aims by motion drifts steadily (Ocarina of Time: the camera turning slowly left). `motion_pro.h` takes the mean of a second of stillness (every axis under 2 °/s with a spread under 0.5 °/s, |acc| within 5 % of 1 G and steady) as the zero and subtracts it from every sample after, relearning it at the next rest; the log says the values once (`gyro zero learned from a second at rest`). A slow turn about the vertical that stays under 2 °/s for a whole second is learned too, and unlearned at the next rest: never a large error.
+- **Found on:** [Super Mario Galaxy](../../dm/games/010099C022B96000/README.md), docked pointer on a Pro Controller; the drift on [Ocarina of Time](../../dm/games/0400486024DEC000/README.md).
 
 ### Identical controllers that GameController lists as one
 
@@ -616,7 +645,7 @@ Most service calls can be found before they crash, before the first boot or the 
 
 - **Symptom:** `CRASH sig=11 addr=0 pc=0` with the link register just after a call to a `vi::SetLayerNextHdr…` or `vi::ClearLayerNextHdr…` function.
 - **Cause:** the SDK forwards a layer's HDR metadata through a table its graphics system fills, which is null on the host.
-- **Fix:** every layer HDR metadata call of SDK 22's free functions succeeds with nothing to apply (`dm/gfx/hle_vi.c`): the content gamut, the HDR to SDR tone mapping, the standard and extended content luminance ranges, the adjustable Bezier tone curve, and the clears of the gamut, the tone mapping and the curve. The host presents SDR.
+- **Fix:** every layer HDR metadata call of SDK 22's free functions succeeds (`dm/gfx/hle_vi.c`): the content gamut, the HDR to SDR tone mapping and the standard content luminance range are logged and dropped, and the adjustable Bezier tone curve and the clears of the gamut, the tone mapping and the curve are dropped. The extended content luminance range bounds the present's roll-off, and with `DM_HDR_META` on it becomes the HDR layer's HDR10 metadata ([The status query and the present for an HDR window](rendering.md#the-status-query-and-the-present-for-an-hdr-window)).
 - **Found on:** [Donkey Kong Bananza](../../dm/games/040074A01BF12000/README.md) (the set calls); the curve and the clears: [Mario Kart World](../../dm/games/0400C3F00006E000/README.md) 1.8.0 sets the curve every frame, from pull request #1116 (that build is not run here).
 
 ### Layer frame numbers
@@ -1149,6 +1178,12 @@ Most service calls can be found before they crash, before the first boot or the 
 - **Cause:** the game ships its own camera module (`subsdk3`, `nn::camera`) and sorts the results itself. `Initialize` sends command 3 with the device name `Default` and takes success or 0xdc4, the latter passed to the game as "no camera support", a path a console with a camera port never takes; `QueryDeviceConnection` (command 29, a DeviceRequest) reads 0x7c4 as `No camera device detected.`; `Finalize` sends command 4 and aborts on any failure; the connection event is command 21.
 - **Fix:** `camera_answer` (`hle_sf.c`) answers commands 3 and 4 with success, 21 with an event that never fires, and the others, 29 among them, with 0x7c4, so the game sees a console whose camera port has nothing plugged in. `nn::applet::BeginUsingCameraResource` / `EndUsingCameraResource` (the module takes the applet's camera resource) and `nn::camera::sdk::DestroyCameraContext` succeed too; the SDK's versions read service objects the host never made. The client also ends the session with an HIPC Close (message type 2), answered with the closed-session result 0xf601 (`hle_sf.c`); before that it logged `[RED] sf: camera: HIPC message type 2 not served`. Mario Kart World 1.8.0, whose reading of 0xdc4 the old answer followed, is not re-tested here.
 - **Found on:** [Star Fox](../../dm/games/0400E88025B1A000/README.md).
+
+### Selecting a graphics quality tier for diagnostics
+
+- `DM_GRAPHICS_SCALE=0|1|2` overrides the graphics quality tier returned by `oe::GetCurrentGraphicsScale` for controlled experiments.
+- Unset or invalid values preserve the existing operation-mode-dependent response. This does not change operation mode, performance mode, display size, or executable code.
+- Synthetic `t_oe` tests cover valid values, invalid values, and independence from operation mode.
 
 ### Whether the language selection is limited
 

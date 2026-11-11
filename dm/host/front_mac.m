@@ -11,6 +11,7 @@
 // DM_PAD_MERGE=1 merges every controller into player 1 instead, DM_KBD_PLAYER=own makes the keyboard player 1 on its own, with the controllers from player 2 on.
 #import <Cocoa/Cocoa.h>
 #import <QuartzCore/CAMetalLayer.h>
+#include <stdatomic.h>
 #import <Metal/Metal.h>
 #import <GameController/GameController.h>
 #include "dm.h"
@@ -36,6 +37,47 @@ static void merge_rumble_to_s2(int on);
 #include <sys/stat.h>
 
 static CAMetalLayer *g_layer;
+// Whether the window's screen can show EDR at all (its potential headroom is above 1; hle_vi.c answers HDR only then): -1 until the first read, taken as yes.
+// Read four times a second on the main thread while the HDR layer is on, so it follows the window to another screen (an external SDR monitor beside the built-in XDR screen)
+static _Atomic int g_hdr_screen = -1;
+int front_hdr_screen(void) { return atomic_load(&g_hdr_screen) != 0; }
+// The screen's current EDR headroom (maximumExtendedDynamicRangeColorComponentValue), read with the potential one: hle_vi.c's automatic peak (DM_HDR_PEAK=auto) is 100 nits times it, at least twice the paper white.
+// 1.0 until the first read and without the HDR layer. The system grants the headroom while the window is in front, whatever range the game declares, so the automatic peak does not
+// hold itself down: on the XDR panel it read 1.2 when the layer was made and 16 by the game's first query, then followed the brightness slider both ways (16 at low brightness,
+// 3.2 = 1600 / 500 nits at full). In a window behind others it stays at 1.2 with any declared range. Polled, as the system offers no notification for it; the game asks every frame,
+// so a change reaches it within a quarter second
+static _Atomic float g_hdr_headroom = 1.0f;
+float front_hdr_headroom(void) { return atomic_load(&g_hdr_headroom); }
+static void front_hdr_screen_read(NSScreen *s) {
+    // In a reference mode (an XDR preset) the reference headroom is the limit the system keeps to (0 when the screen has none)
+    double cur = s.maximumExtendedDynamicRangeColorComponentValue, ref = s.maximumReferenceExtendedDynamicRangeColorComponentValue;
+    atomic_store(&g_hdr_headroom, (float)(ref > 0 && ref < cur ? ref : cur));
+    double pot = s.maximumPotentialExtendedDynamicRangeColorComponentValue;
+    int can = pot > 1.0;
+    if (atomic_exchange(&g_hdr_screen, can) != can) LOG("front end: the window's screen %s EDR (%s, potential headroom %.2f)", can ? "can show" : "cannot show", s.localizedName.UTF8String, pot);
+}
+// The HDR layer's HDR10 metadata (CAEDRMetadata), only with DM_HDR_META=1 (hle_vi.c dm_hdr_meta; off by default on the Mac): Core Animation maps the layer's range into the
+// screen's current headroom by it. The range is the one the game declares
+// (0 to 1000 nits until it says, hle_vi.c front_hdr_content_range). opticalOutputScale is passed the paper white, but for a normalized format such as the PQ layer's RGB10A2
+// Core Animation takes it as 10,000 (CAEDRMetadata.h), and it made no difference in a measurement. macOS shows PQ relative to the
+// screen's white (100 nits = EDR 1.0) and passes it through while the range fits in 100 x headroom, and compresses the whole picture when it does not (docs/reference/rendering.md).
+// Off by default because, in fullscreen, the layer with metadata of any range showed rectangles of older frames under GPU load, and the mapping made the game's white follow the
+// brightness slider; without it the automatic peak keeps the game within the screen and the present rolls off the rest
+int dm_hdr_meta(void);   // hle_vi.c: DM_HDR_META
+void dm_hdr_layer_meta_set(int on);   // hle_vi.c: what the roll-off and the present's order follow
+static _Atomic int g_hdr_meta;   // the layer has the metadata (DM_HDR_META=1, and CAEDRMetadata is available); written on the main thread when the layer is made
+static _Atomic uint32_t g_hdr_range = 1000u << 16;   // the declared range: low nits in bits 0-15, high in 16-31
+static void front_hdr_metadata(void) {   // main thread
+    uint32_t r = atomic_load(&g_hdr_range);
+    g_layer.EDRMetadata = [CAEDRMetadata HDR10MetadataWithMinLuminance:(float)(r & 0xffff) maxLuminance:(float)(r >> 16) opticalOutputScale:dm_hdr_paper_white()];
+}
+void front_hdr_content_range(unsigned lo, unsigned hi) {
+    if (!atomic_load(&g_hdr_meta) || hi <= lo || hi > 65535) return;
+    uint32_t r = lo | hi << 16;
+    if (atomic_exchange(&g_hdr_range, r) == r) return;
+    LOG("front end: HDR10 metadata: the game's range %u..%u nits", lo, hi);
+    dispatch_async(dispatch_get_main_queue(), ^{ front_hdr_metadata(); });
+}
 static uint64_t g_btn;
 static int g_w, g_a, g_s, g_d;
 static int g_rl, g_ru, g_rr, g_rd;   // arrow keys pressed with Shift held: the right stick (each goes back up as it went down, whatever Shift does meanwhile)
@@ -64,6 +106,8 @@ static _Atomic int g_fullscreen;   // the window is in fullscreen (set when it h
 // the game, which keeps its focus, and ShowKeyboard's applet sends its own out-of-focus / in-focus pair (DM_APPLET). Monster Hunter Rise dropped the hunter's name after the round trip and asked again. Main thread only
 static int g_text_box;
 int front_fullscreen(void) { return g_fullscreen; }   // nvn_mtl.m link_latency: frame latency 2 in variable-refresh fullscreen
+static _Atomic int g_window_covered;   // no part of the window is on screen (other windows over it, minimized, another Space): from its occlusion state, on the main thread
+int front_window_covered(void) { return g_window_covered; }   // nvn_mtl.m link_sync: presents follow the host's clock while it is
 // The screen's refresh rate matched to the game's frame rate in fullscreen (front_screen_match, from PR #79; DM_SCREEN_MATCH=0 turns it off). 60 fps on a 144 Hz screen cannot be paced
 // evenly: the display link counts a tick on the refresh nearest each 1/60 s slot (nvn_mtl.m link_range), so frames stay up 2 and 3 refreshes in turn (13.9 / 20.8 ms) and Apple's HUD shows
 // the frame interval jumping between them. In fullscreen, a screen whose rate is not a multiple of the game's switches to the mode of the same size with the highest rate that is (144 → 120 Hz
@@ -407,13 +451,14 @@ static void s2pad_read(s2_pad *d) {
     if (m) merge_rumble_to_s2(1);
     pad_set(p, m, s[0], s[1], s[2], s[3]);
 }
-static void s2pad_attach(s2_pad *d) {
-    if (g_press_to_join && !g_merge) { LOG("controller '%s' (Bluetooth) connected: press a button to play (DM_PAD_PRESS_TO_JOIN)", d->name); cp_poll(); return; }
+static int s2pad_attach(s2_pad *d) {   // pad_switch2_apple.h: 0 only when every player is taken
+    if (g_press_to_join && !g_merge) { LOG("controller '%s' (Bluetooth) connected: press a button to play (DM_PAD_PRESS_TO_JOIN)", d->name); cp_poll(); return 1; }
     int p = g_merge ? 0 : pad_slot_take(&g_slots, d, d->name); char nb[16];
-    if (p < 0) { LOG("controller '%s' (Bluetooth) connected: all %d players are taken, not used", d->name, DM_PLAYERS); return; }
+    if (p < 0) { LOG("controller '%s' (Bluetooth) connected: all %d players are taken, not used", d->name, DM_PLAYERS); return 0; }
     npad_name(p, nb, sizeof nb); LOG("controller '%s' (Bluetooth) connected: player %d (npad %s)", d->name, p + 1, nb);
     if (!g_merge) { dm_pad_players(pad_slot_mask(&g_slots)); dm_haptics_apple_set_sink(p, dm_switch2_rumble); }   // its rumble goes over Bluetooth, not to a Core Haptics engine
     cp_poll();   // one controller fewer to wait for
+    return 1;
 }
 static void s2pad_detach(s2_pad *d) {   // d is already off g_s2pads
     if (g_merge) {
@@ -639,6 +684,39 @@ void front_picture_shape(int w, int h) { if (w > 0 && h > 0) g_picture_aspect = 
 - (void)viewDidChangeBackingProperties { [super viewDidChangeBackingProperties]; [self fitDrawable]; }
 @end
 
+// Frame-rate counter (DM_SHOW_FPS=1, the iPhone's switch; the NSP script's Mac run command sets it unless --no-show-fps; Window > Frame-Rate Counter turns it on and off): top left over
+// the picture, once a second, the frames put on screen in that second (nvn_mtl.m counts them for NVN and the Vulkan layer alike), the longest time between two of them (a freeze shows
+// there and not in the rate) and the mean GPU time of the frames completed in that second. A longer span than 1.5 s (the app was stopped in a debugger) shows no reading
+uint64_t mtl_present_count(void);
+void mtl_frame_stats(double *gap_max_ms, double *gpu_ms);
+static NSTextField *g_fps; static NSTimer *g_fps_timer;
+static void fps_show(BOOL on) {
+    if (!on) { [g_fps_timer invalidate]; g_fps_timer = nil; [g_fps removeFromSuperview]; g_fps = nil; return; }
+    if (g_fps || !g_win) return;
+    NSView *cv = g_win.contentView;
+    NSTextField *l = g_fps = [NSTextField labelWithString:@"-- fps"];
+    l.font = [NSFont monospacedDigitSystemFontOfSize:12 weight:NSFontWeightSemibold]; l.textColor = NSColor.whiteColor;
+    l.drawsBackground = YES; l.backgroundColor = [NSColor colorWithWhite:0 alpha:0.5]; l.wantsLayer = YES; l.layer.cornerRadius = 5; l.layer.masksToBounds = YES;
+    l.frame = NSMakeRect(8, cv.bounds.size.height - 8 - 18, 240, 18); l.autoresizingMask = NSViewMinYMargin;   // stays at the top left when the window resizes
+    [cv addSubview:l];
+    double gap, gpu; mtl_frame_stats(&gap, &gpu);   // starts the spans now
+    __block uint64_t n0 = mtl_present_count(); __block double t0 = CACurrentMediaTime();
+    g_fps_timer = [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *t) {
+        (void)t; uint64_t n = mtl_present_count(); double now = CACurrentMediaTime(), gap, gpu; mtl_frame_stats(&gap, &gpu);
+        if (now - t0 < 1.5) {
+            NSString *s = [NSString stringWithFormat:@" %.0f fps · max %.0f ms", (n - n0) / (now - t0), gap];
+            if (gpu >= 0) s = [s stringByAppendingFormat:@" · GPU %.1f ms", gpu];
+            l.stringValue = s; [l sizeToFit]; NSRect f = l.frame; f.size.width += 6; f.origin.y = cv.bounds.size.height - 8 - f.size.height; l.frame = f;
+        }
+        n0 = n; t0 = now;
+    }];
+    LOG("front end: frame-rate counter on");
+}
+@interface DmFpsItem : NSObject @end
+@implementation DmFpsItem
+- (void)toggle:(NSMenuItem *)i { fps_show(!g_fps); i.state = g_fps ? NSControlStateValueOn : NSControlStateValueOff; }
+@end
+
 // AppKit reports a refused fullscreen request only to the window delegate (there is no notification for it)
 static void (^g_fs_failed)(void);
 @interface DmWinDelegate : NSObject <NSWindowDelegate> @end
@@ -690,6 +768,27 @@ static NSString *cheat_display_name(int i) {
 static BOOL cheat_has_row(int i) {
     int f = dm_cheat_flags_at(i);
     return !(f & (DM_CHEAT_PAIR_OFF | DM_CHEAT_SECTION_START | DM_CHEAT_SECTION_END));
+}
+
+// A section is a folder: the panel folds its rows under its header, the menu lists them in a submenu. Folded by default
+// when it has more rows than this (a map select's 48 locations), open otherwise; the player's own choice wins
+enum { SECTION_FOLD_ROWS = 10 };
+
+// Section s's cheat rows (an on / off pair counts once; labels do not count) and how many of them are on
+static void section_counts(const char *s, int *rows, int *on) {
+    *rows = *on = 0;
+    for (int i = 0, n = dm_cheats_ncheats(); i < n; i++) {
+        if (!cheat_has_row(i) || dm_cheat_kind_at(i) == 3 || strcmp(dm_cheat_section_at(i), s)) continue;
+        ++*rows;
+        *on += dm_cheat_kind_at(i) == 0 && dm_cheat_on_at(i);
+    }
+}
+
+// A section's line of counts, beside its name: "49 cheats, 2 on" (", 2 on" only when some are)
+static NSString *section_counts_text(const char *s) {
+    int rows, on;
+    section_counts(s, &rows, &on);
+    return [NSString stringWithFormat:@"%d cheat%@%@", rows, rows == 1 ? @"" : @"s", on ? [NSString stringWithFormat:@", %d on", on] : @""];
 }
 
 // The row's whole title, the same string the menu's row carries: the name, plus the run-time reason when there is one,
@@ -745,9 +844,10 @@ static void cheats_open_folder(void) {
 // beyond the controls. Top to bottom:
 //   - the header (game build and version, counts) and, when it applies, a line about safe mode with Restore;
 //   - Cheats On (the master switch), Select All / Deselect All and the search field;
-//   - the rows: section headers, labels, one row per cheat (an on / off pair is one row; a "set" cheat has an Apply button
-//     instead of a checkbox; an "ask" cheat a value field; ⓘ shows its details), then the cheats the compiler left out,
-//     the other builds' files, and the anchored sources not compiled for this build;
+//   - the rows: section headers that fold their rows away (sectionRow:), labels, one row per cheat (an on / off pair is
+//     one row; a "set" cheat has an Apply button instead of a checkbox; an "ask" cheat a value field; ⓘ shows its
+//     details), then the cheats the compiler left out, the other builds' files, and the anchored sources not compiled
+//     for this build;
 //   - a details line (a cheat's dry run and note, or the load report);
 //   - Reload, Open folder, Find Cheats… (in Ryujinx, the yuzu family and SD cards) and Report.
 // A .txt or a .cheats.toml dropped on the panel is copied into the cheats folder (import below; the drop works from a
@@ -801,7 +901,8 @@ static DmCheatsPanel *g_cheats_panel;   // created on the first Show Cheats Wind
 // The Cheats menu of the game window (hle_cheats.c's rows, only meaningful with a window): rebuilt on every open, so the
 // loaded file's state, the menu's toggles and the cheats the VM disabled at run time are what the player sees. Rows: Show
 // Cheats Window (⌘⇧C), Cheats On (the master switch) and, in safe mode, Restore Saved Cheats; then the panel's rows in
-// short (section headers, labels, one row per cheat, a pair as one row, "set" cheats applied on click), the other builds'
+// short (each section's rows in a submenu titled with its name, labels, one row per cheat, a pair as one row, "set"
+// cheats applied on click), the other builds'
 // files when none of this build is loaded, and Reload cheats (⌘R) / Open cheats folder. A click here also refreshes the
 // panel when one exists, so the two never disagree
 @interface DmCheatsMenuDelegate : NSObject <NSMenuDelegate>
@@ -818,17 +919,31 @@ static DmCheatsPanel *g_cheats_panel;   // created on the first Show Cheats Wind
     if (dm_cheats_safe()) [menu addItemWithTitle:@"Restore Saved Cheats (safe mode)" action:@selector(restoreSafe:) keyEquivalent:@""].target = self;
     [menu addItem:NSMenuItem.separatorItem];
     const char *sec = "";
+    NSMenu *into = menu;   // the section's submenu while inside one
     for (int i = 0, n = dm_cheats_ncheats(); i < n; i++) {
         if (!cheat_has_row(i)) continue;
         const char *s = dm_cheat_section_at(i);
-        if (strcmp(s, sec)) {   // a section header before its first entry
+        if (strcmp(s, sec)) {   // a section's submenu before its first entry; its rows go there
             sec = s;
-            if (*s) [menu addItemWithTitle:[NSString stringWithFormat:@"— %@ —", engine_str(s)] action:nil keyEquivalent:@""].enabled = NO;
+            into = menu;
+            if (*s) {
+                int rows, on;
+                section_counts(s, &rows, &on);
+                NSString *name = engine_str(s), *shown = name;
+                if (shown.length > 60)   // a long section name (EdiZon's often carry a whole instruction) is cut, whole in the tooltip
+                    shown = [[shown substringWithRange:[shown rangeOfComposedCharacterSequencesForRange:NSMakeRange(0, 59)]] stringByAppendingString:@"…"];
+                if (on) shown = [shown stringByAppendingFormat:@" (%d on)", on];
+                NSMenuItem *head = [menu addItemWithTitle:shown action:nil keyEquivalent:@""];
+                head.toolTip = name;
+                into = [[NSMenu alloc] initWithTitle:name];
+                into.autoenablesItems = NO;   // the rows set enabled themselves, as in the top menu
+                head.submenu = into;
+            }
         }
         int kind = dm_cheat_kind_at(i), f = dm_cheat_flags_at(i);
         NSString *title = cheat_row_title(i);
         if (f & DM_CHEAT_ONCE) title = [title stringByAppendingString:@" (apply once)"];
-        NSMenuItem *it = [menu addItemWithTitle:title action:nil keyEquivalent:@""];
+        NSMenuItem *it = [into addItemWithTitle:title action:nil keyEquivalent:@""];
         if (kind == 0) { it.target = self; it.action = @selector(toggleCheat:); it.tag = i; }
         it.enabled = kind == 0;
         it.state = cheat_row_state(i);
@@ -892,6 +1007,8 @@ static DmCheatsMenuDelegate *g_cheats_menu;   // NSMenu keeps its delegate unret
     NSTimer *_refreshTimer;       // ~1 s, scheduled only while the panel is on screen; invalidated when it hides
     BOOL _upOnDeactivate;         // the panel was on screen when the app was deactivated: AppKit brings it back on activation
     BOOL _finding;                // a Find Cheats… scan is running on a background queue: another click does not start a second one
+    NSMutableDictionary<NSString *, NSNumber *> *_folded;   // section name -> folded (YES) or open (NO) as the player left it; absent: the default
+    NSMutableDictionary<NSString *, NSTextField *> *_sectionCounts;   // section name -> its header's counts, to update in place
 }
 
 // A button of the panel's toolbar rows
@@ -1011,6 +1128,7 @@ static NSTextField *panel_note(NSString *text) {
     _checks = [NSMutableDictionary dictionary];
     _values = [NSMutableDictionary dictionary];
     _labels = [NSMutableDictionary dictionary];
+    _sectionCounts = [NSMutableDictionary dictionary];
     _rows_sig = @"";
     if (![_panel setFrameUsingName:@"DmCheatsPanel"] && g_win) {   // first use: beside the game window, not the screen's corner
         NSRect g = g_win.frame, f = _panel.frame;
@@ -1294,11 +1412,68 @@ static NSArray<NSURL *> *found_cheat_files(NSString *build) {
     return panel_hrow(views);
 }
 
-// A section header: the section's name in bold
-- (NSView *)sectionRow:(const char *)name {
-    NSTextField *l = [NSTextField labelWithString:engine_str(name)];
-    l.font = [NSFont boldSystemFontOfSize:NSFont.systemFontSize];
-    return l;
+// The user-defaults key of the folded sections: one dictionary per game build (section name -> folded), so another
+// build's file with the same section names keeps its own choice
+static NSString *folded_key(void) { return [@"DmCheatsPanel.folded." stringByAppendingString:engine_str(dm_cheats_build())]; }
+
+// Is the section folded? The player's last click on its header, else folded when it has more than SECTION_FOLD_ROWS rows
+- (BOOL)sectionFolded:(const char *)s {
+    if (!_folded) _folded = [[NSUserDefaults.standardUserDefaults dictionaryForKey:folded_key()] mutableCopy] ?: [NSMutableDictionary dictionary];
+    NSNumber *v = _folded[engine_str(s)];
+    if (v) return v.boolValue;
+    int rows, on;
+    section_counts(s, &rows, &on);
+    return rows > SECTION_FOLD_ROWS;
+}
+
+// A section header: a chevron and the name in bold, one borderless button that folds or opens the section, then its
+// counts ("49 cheats, 2 on": a folded section still shows what is on in it). While a search is active it shows every
+// match whatever the fold, so the header is then a plain label, without a chevron
+- (NSView *)sectionRow:(const char *)s folded:(BOOL)folded searching:(BOOL)searching {
+    NSString *name = engine_str(s);
+    NSFont *bold = [NSFont boldSystemFontOfSize:NSFont.systemFontSize];
+    NSView *head;
+    if (searching) {
+        NSTextField *l = [NSTextField labelWithString:name];
+        l.font = bold;
+        head = l;
+    } else {
+        NSImage *chev = [NSImage imageWithSystemSymbolName:folded ? @"chevron.right" : @"chevron.down"
+                                  accessibilityDescription:folded ? @"Show" : @"Hide"];   // nil only if the symbol is gone
+        NSButton *b = chev ? [NSButton buttonWithTitle:name image:chev target:self action:@selector(sectionClicked:)]
+                           : [NSButton buttonWithTitle:[(folded ? @"▸ " : @"▾ ") stringByAppendingString:name] target:self action:@selector(sectionClicked:)];
+        b.bordered = NO;
+        b.imagePosition = NSImageLeading;
+        b.font = bold;
+        b.identifier = name;   // the section sectionClicked: folds or opens
+        b.tag = folded;        // and its fold as shown (the name may not be the engine's bytes: Shift-JIS or Latin-1)
+        b.toolTip = [NSString stringWithFormat:@"%@\nClick to %@ its cheats", name, folded ? @"show" : @"hide"];
+        head = b;
+    }
+    ((NSControl *)head).lineBreakMode = NSLineBreakByTruncatingTail;   // a long name never widens the panel
+    [head setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
+    if (searching) head.toolTip = name;
+    NSTextField *counts = panel_note(section_counts_text(s));
+    [counts setContentCompressionResistancePriority:NSLayoutPriorityDefaultHigh forOrientation:NSLayoutConstraintOrientationHorizontal];
+    _sectionCounts[name] = counts;
+    return panel_hrow(@[head, counts]);
+}
+
+// A section header clicked: fold or open the section, remember it in the user defaults, rebuild the rows a main-queue turn
+// later (the rebuild removes this very button, whose mouse tracking is still on the stack)
+- (void)sectionClicked:(NSButton *)b {
+    NSString *name = b.identifier;
+    if (!name || !_folded) return;   // _folded was loaded when the header was built (sectionFolded:)
+    _folded[name] = @(!b.tag);
+    [NSUserDefaults.standardUserDefaults setObject:_folded forKey:folded_key()];
+    dispatch_async(dispatch_get_main_queue(), ^{ [self rebuildRows]; });
+}
+
+// A row inside a section, indented under its header like a folder's contents
+static NSView *section_indent(NSView *v) {
+    NSStackView *s = [v isKindOfClass:NSStackView.class] ? (NSStackView *)v : panel_hrow(@[v]);
+    s.edgeInsets = NSEdgeInsetsMake(0, 20, 0, 0);
+    return s;
 }
 
 // Does entry i pass the search text (its name or its section contains it, any case)?
@@ -1329,14 +1504,21 @@ static NSArray<NSURL *> *found_cheat_files(NSString *build) {
     for (NSTextField *v in _values.allValues) if (v.currentEditor) [v abortEditing];
     for (NSView *v in [_stack.arrangedSubviews copy]) [v removeFromSuperview];
     _rebuilding = NO;
-    [_checks removeAllObjects]; [_values removeAllObjects]; [_labels removeAllObjects];
+    [_checks removeAllObjects]; [_values removeAllObjects]; [_labels removeAllObjects]; [_sectionCounts removeAllObjects];
     const char *sec = "";
+    BOOL searching = _search.stringValue.length > 0, folded = NO;   // a search shows its matches in folded sections too
     for (int i = 0, n = dm_cheats_ncheats(); i < n; i++) {
         if (!cheat_has_row(i) || ![self matches:i]) continue;
         const char *s = dm_cheat_section_at(i);
-        if (strcmp(s, sec)) { sec = s; if (*s) [_stack addArrangedSubview:[self sectionRow:s]]; }
-        if (dm_cheat_kind_at(i) == 3) [_stack addArrangedSubview:panel_note(cheat_display_name(i))];   // a label: credits and the like
-        else [_stack addArrangedSubview:[self cheatRow:i]];
+        if (strcmp(s, sec)) {   // a section's header before its first entry (shown)
+            sec = s;
+            folded = *s && !searching && [self sectionFolded:s];
+            if (*s) [_stack addArrangedSubview:[self sectionRow:s folded:folded searching:searching]];
+        }
+        if (folded) continue;
+        NSView *row = dm_cheat_kind_at(i) == 3 ? panel_note(cheat_display_name(i))   // a label: credits and the like
+                                               : [self cheatRow:i];
+        [_stack addArrangedSubview:*s ? section_indent(row) : row];
     }
     for (int i = 0, n = dm_cheats_nskipped(); i < n; i++)
         [_stack addArrangedSubview:panel_note([NSString stringWithFormat:@"Left out of this build: %@ — %@", engine_str(dm_cheats_skipped_name(i)), engine_str(dm_cheats_skipped_why(i))])];
@@ -1394,6 +1576,18 @@ static NSArray<NSURL *> *found_cheat_files(NSString *build) {
         if (v.currentEditor) return;
         char cur[64]; if (dm_cheat_value_get(k.intValue, cur, sizeof cur) && ![v.stringValue isEqualToString:@(cur)]) v.stringValue = @(cur);
     }];
+    if (!_sectionCounts.count) return;
+    NSMutableSet<NSString *> *seen = [NSMutableSet set];   // each section's counts once (dm_cheat_section_at's string, by name)
+    for (int i = 0, n = dm_cheats_ncheats(); i < n; i++) {
+        const char *s = dm_cheat_section_at(i);
+        if (!*s) continue;
+        NSString *name = engine_str(s);
+        NSTextField *c = _sectionCounts[name];
+        if (!c || [seen containsObject:name]) continue;
+        [seen addObject:name];
+        NSString *t = section_counts_text(s);
+        if (![c.stringValue isEqualToString:t]) c.stringValue = c.toolTip = t;
+    }
 }
 
 // The details line: the shown cheat's dry run and note, or the load report
@@ -1521,6 +1715,25 @@ void front_run(void (*guest)(void)) {
         g_layer = [CAMetalLayer layer];
         g_layer.device = MTLCreateSystemDefaultDevice();
         g_layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+        // DM_HDR=1 (the HDR mode): an HDR layer whatever the window's screen, without HDR10 metadata unless DM_HDR_META=1 (front_hdr_metadata); a screen without headroom shows
+        // the SDR range. The layer is RGB10A2 in BT.2100 PQ: the game's HDR10 window goes in as it is, an SDR source is encoded as HDR10 at the paper white (nvn_mtl.m
+        // present_mode). Not an RGBA16Float extended linear layer, which showed black blocks on a MacBook Air M5 (docs/reference/rendering.md, the status query and the present for an HDR window)
+        dm_hdr_layer_meta_set(0);   // an SDR layer has none (set again below for the HDR layer)
+        if (getenv("DM_HDR") && atoi(getenv("DM_HDR"))) {
+            g_layer.pixelFormat = MTLPixelFormatRGB10A2Unorm;
+            CGColorSpaceRef ecs = CGColorSpaceCreateWithName(kCGColorSpaceITUR_2100_PQ);
+            g_layer.colorspace = ecs; CGColorSpaceRelease(ecs);
+            g_layer.wantsExtendedDynamicRangeContent = YES;
+            if (!dm_hdr_meta()) LOG("front end: no HDR10 metadata on the HDR layer (the default; DM_HDR_META=1 adds it): PQ is shown as it is, the present rolls off a range above the screen's");
+            else if (CAEDRMetadata.available) { atomic_store(&g_hdr_meta, 1); front_hdr_metadata(); }
+            else LOG("[RED] front end: no EDR metadata on this Mac (CAEDRMetadata): values above the screen's headroom clip");
+            dm_hdr_layer_meta_set(atomic_load(&g_hdr_meta));
+            if (atoi(getenv("DM_HDR")) == 2) win.title = [win.title stringByAppendingString:@" (DM_HDR=2: HDR on any screen)"];   // told apart from the setting's DM_HDR=1
+            LOG("front end: HDR output on (DM_HDR): the window's layer is RGB10A2 in BT.2100 PQ%s; the screen's headroom %.2f now, at most %.2f", atomic_load(&g_hdr_meta) ? ", with HDR10 metadata" : "",
+                (win.screen ?: NSScreen.mainScreen).maximumExtendedDynamicRangeColorComponentValue, (win.screen ?: NSScreen.mainScreen).maximumPotentialExtendedDynamicRangeColorComponentValue);
+            front_hdr_screen_read(win.screen ?: NSScreen.mainScreen);
+            [NSTimer scheduledTimerWithTimeInterval:0.25 repeats:YES block:^(NSTimer *t) { (void)t; front_hdr_screen_read(win.screen ?: NSScreen.mainScreen); }];
+        }
         g_layer.contentsScale = win.backingScaleFactor;
         // Apple's HUD over the game (frame rate, frame and GPU time, memory): front_hud_env turns it on before the first device. The layer's developerHUDProperties
         // stay unset: mode=default forces this layer's HUD on, so the Metal HUD menu's Hide HUD left it on screen
@@ -1535,9 +1748,13 @@ void front_run(void (*guest)(void)) {
         // another app's window macOS fires its display link about once a second: Breath of the Wild stepped up to 3 vsyncs at boot and never came back (20 fps runs).
         // DM_WINDOW_TOP=1 orders it in front without activation and keeps it above other apps' windows; the log names every change of the window's visibility either way
         if (getenv("DM_WINDOW_TOP") && atoi(getenv("DM_WINDOW_TOP"))) { win.level = NSFloatingWindowLevel; [win orderFrontRegardless]; LOG("front end: window kept in front (DM_WINDOW_TOP)"); }
-        [[NSNotificationCenter defaultCenter] addObserverForName:NSWindowDidChangeOcclusionStateNotification object:win queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) {
-            (void)n; static int vis = -1; int v = (win.occlusionState & NSWindowOcclusionStateVisible) != 0; if (v == vis) return; vis = v;
-            if (v) LOG("front end: window visible"); else LOG("front end: window covered (its display link fires about once a second: frame times measure nothing)"); }];
+        // Covered, the display link would pace the game at that rate (Star Fox: 333 ms frames while the player typed in another app), so the present thread paces presents by the
+        // host's clock until the window is visible again (nvn_mtl.m link_sync). The state is read once more a second after opening: a window that opens behind another and stays
+        // there may send no change (a second, not at once, to leave the window server time to place it)
+        void (^occl)(void) = ^{ static int vis = -1; int v = (win.occlusionState & NSWindowOcclusionStateVisible) != 0; if (v == vis) return; vis = v; g_window_covered = !v;
+            if (v) LOG("front end: window visible"); else LOG("front end: window covered (its display link fires about once a second: presents follow the host's clock until it is visible)"); };
+        [[NSNotificationCenter defaultCenter] addObserverForName:NSWindowDidChangeOcclusionStateNotification object:win queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) { (void)n; occl(); }];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), dispatch_get_main_queue(), occl);
         // Main menu: AppKit runs ⌘ shortcuts only through menu items, so ⌘Q quits and ⌃⌘F toggles fullscreen from here (AppKit shows the item as Globe-F and keeps ⌃⌘F as a hidden twin)
         NSMenu *bar = [NSMenu new], *app = [NSMenu new], *wm = [[NSMenu alloc] initWithTitle:@"Window"];
         [[bar addItemWithTitle:@"" action:nil keyEquivalent:@""] setSubmenu:app];
@@ -1556,7 +1773,10 @@ void front_run(void (*guest)(void)) {
             dispatch_async(dispatch_get_main_queue(), ^{ [g_cheats_menu showPanel:nil]; });
         [[bar addItemWithTitle:@"Window" action:nil keyEquivalent:@""] setSubmenu:wm];
         [wm addItemWithTitle:@"Enter Full Screen" action:@selector(toggleFullScreen:) keyEquivalent:@"f"].keyEquivalentModifierMask = NSEventModifierFlagControl | NSEventModifierFlagCommand;
+        static DmFpsItem *fps_target; fps_target = [DmFpsItem new];
+        NSMenuItem *fps_item = [wm addItemWithTitle:@"Frame-Rate Counter" action:@selector(toggle:) keyEquivalent:@""]; fps_item.target = fps_target;
         NSApp.mainMenu = bar;
+        { const char *e = getenv("DM_SHOW_FPS"); if (e && atoi(e)) { fps_show(YES); fps_item.state = NSControlStateValueOn; } }
         const char *fs = getenv("DM_FULLSCREEN");   // 1 (or any value but 0): start in fullscreen; 0, the settings window's Window, or unset: a window
         if (fs && strcmp(fs, "0")) {
             // A game opened from a fullscreen app starts while macOS leaves that Space. Wait for activation and for the window to reach the active Space before asking for fullscreen

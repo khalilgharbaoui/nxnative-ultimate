@@ -29,6 +29,14 @@ int main(void) {
     r[1] = 0; assert(pro_motion_decode(&s, r, 49, t + 415000000, out) == 3);   // report counter wrap
     for (int k = 0; k < 3; k++) word(r, k, 5, 20);
     r[1]++; assert(pro_motion_decode(&s, r, 49, t + 430000000, out) == 3 && out[2].rot[2] > 0);   // slow turn is not learned as bias
+    // The zero at rest: a second of stillness with a constant offset on the gyro (x +5, y -8, z +10 counts) is taken off; a turn after reads minus that zero
+    pro_motion z = {0}; uint8_t q[64] = {0x30}; uint64_t tz = 2000000000;
+    for (int k = 0; k < 3; k++) { word(q, k, 0, 0); word(q, k, 1, 0); word(q, k, 2, 4096); word(q, k, 3, 5); word(q, k, 4, -8); word(q, k, 5, 10); }
+    for (int n = 0; n < PRO_BIAS_SAMPLES / 3 + 1; n++) { q[1]++; assert(pro_motion_decode(&z, q, 49, tz += 15000000, out) == 3); }
+    assert(z.bias_set && fabsf(out[2].rot[0]) < 1e-5f && fabsf(out[2].rot[1]) < 1e-5f && fabsf(out[2].rot[2]) < 1e-5f);
+    assert(fabsf(z.bias[1] - 5 * .070f * (float)M_PI / 180) < 1e-5f);   // y: raw x (+5) → Switch y
+    for (int k = 0; k < 3; k++) word(q, k, 5, 510);   // a turn of 35 deg/s about z, the zero's 0.7 taken off
+    q[1]++; assert(pro_motion_decode(&z, q, 49, tz += 15000000, out) == 3 && fabsf(out[2].rot[2] - 500 * .070f * (float)M_PI / 180) < 1e-4f && z.still == 0);
     assert(pro_motion_player(1, 1, 2) == 2);
     assert(pro_motion_player(1, 1, -1) == -1 && pro_motion_player(0, 1, 0) == -1);
     assert(pro_motion_player(2, 1, 0) == -1 && pro_motion_player(1, 2, 0) == -1);
