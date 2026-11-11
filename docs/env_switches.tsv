@@ -19,6 +19,7 @@ DM_CHEATS_ANY_BUILD	switch	`1` loads a cheat file written for another build of t
 DM_CHEATS_DEBUG	diagnostic	Logs every memory write a cheat makes and the cheat file context the menu's "another version" rows come from
 DM_CHEATS_ON	switch	Comma-separated cheat names turned on at launch, besides the saved per-build enabled states
 DM_CHEATS_WINDOW	switch	`1` opens the Mac Cheats panel beside the game from the start
+DM_CONTROLS_CAPTURE	test	`=<folder>`: `tests/t_controls_mac.m` also draws the Mac Controls panel's content into `controls-panel.png` there
 DM_COPY_GAME_RESOURCES	switch	`NO` skips the Xcode build phase that copies the game's resources into the app (`stage_resources.sh`, on by default); `build_ipa.sh` sets it for its unsigned build, which packs them itself
 DM_COPY_ROMFS	switch	`NO` keeps the game files out of the app, in the Xcode build phase (`stage_resources.sh`) and in the unsigned IPA of `build_ipa.sh` (on by default): `main.m` takes the validated `Documents/romfs.img` copied by `scripts/push_romfs.sh`, then a `Documents/romfs` folder; the build writes the image's identity as `romfs.id` into the app, and `main.m` uses only a matching image (`--romfs separate` of the NSP script sets this)
 DM_CTL	diagnostic	`=<file>` (Mac): the host polls the file every 100 ms and runs each appended line: button presses, `shot`, `passdump`, `texdump`, `env KEY=VALUE`, `peek`, `memdump`, `drag` and more
@@ -353,6 +354,7 @@ DM_SHADER_FILES	switch	`1` packs an NVN game's shader library into the unsigned 
 DM_SHAKE_G	switch	`=<G>`: on iOS, the acceleration beyond gravity above which a flick of the phone shakes the controller's six-axis sensor (default 1.5)
 DM_SHARED_FONT	path	Font file served for every shared-font type except the Nintendo extension (default `$DM_FONT_DIR/standard.ttf`, then macOS's Arial Unicode)
 DM_SHARED_FONT_EXT	path	Font file served for shared-font type 5, the Nintendo extension with the button icons (default `$DM_FONT_DIR/nintendo_ext.ttf`, made by `make_ext_font.py`)
+DM_SHOW_CONTROLS	switch	`1` shows the Mac Controls panel (every Switch control and its key, the window's shortcuts) at launch, `0` keeps it hidden; unset, it is up or not as the player left it (Window > Show Controls, ⌘K)
 DM_SHOW_FPS	player	`1` shows the frame-rate counter at the top left (frames put on screen per second; on the Mac also the longest time between two of them and the mean GPU time per frame, and Window > Frame-Rate Counter turns it on and off); at IPA build it sets `DMShowFPS` in `Info.plist`, which `Documents/env.txt` overrides; the NSP script's Mac run command sets it unless `--no-show-fps`
 DM_SLOWFRAME	diagnostic	`=1` writes the per-frame timing breakdown to the log only for dropped frames (kept in a ring of the last 16 frames, judged 8 frames late)
 DM_SPIN	switch	`0` makes the rewriter's spin gate return at once, so guest poll loops spin with no sleep; the gate stays (on by default)
