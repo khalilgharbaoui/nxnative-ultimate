@@ -87,7 +87,7 @@ iPhone and iPad. **Fit**, the default, shows the game's picture (16:9, or the ta
 
 ### HDR output
 
-Shown for Switch 2 games, on the Mac and the iPhone (measured on Donkey Kong Bananza, Ocarina of Time and, to its title screen and races, Mario Kart World; the other Switch 2 titles are untested). **On** starts the game with its own HDR output: on a screen with HDR headroom, whites stay at the screen's normal white and the picture's highlights can go brighter above it; on a screen that cannot show HDR (most external monitors) the game is told so and shows its own SDR picture, and moving the window between screens switches it (Mario Kart World). **On** is the default; **Off** keeps the picture as SDR. On the iPhone and iPad the in-game menu turns it on and off while the game runs (the game changes its picture within a frame or two); on the Mac it applies from the next start.
+Shown for Switch 2 games, on the Mac and the iPhone (measured on Donkey Kong Bananza, Ocarina of Time and, to its title screen and races, Mario Kart World; the other Switch 2 titles are untested). **On** starts the game with its own HDR output: on a screen with HDR headroom, whites stay at the screen's normal white and the picture's highlights can go brighter above it; on a screen that cannot show HDR (most external monitors) the game is told so and shows its own SDR picture, and moving the window between screens switches it (Mario Kart World). **Off**, the default, keeps the picture as SDR. On the iPhone and iPad the in-game menu turns it on and off while the game runs (the game changes its picture within a frame or two); on the Mac it applies from the next start.
 
 ### HDR paper white
 

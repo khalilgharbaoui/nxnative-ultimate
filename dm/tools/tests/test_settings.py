@@ -52,7 +52,7 @@ class HdrSetting(unittest.TestCase):
             for gid,sdk,shown in [('040074A01BF12000',ounce,True),('040074A01BF12000',nx,False),('010056B015FE8000',nx,False),('040074A01BF12000',None,False)]:   # Donkey Kong Bananza (Switch 2); the same game on a Switch 1 SDK; NieR:Automata (Switch 1); no sdk module
                 hdr=hdr_rows(gid,platform,sdk)
                 self.assertEqual(bool(hdr),shown,(platform,gid,sdk))
-                if hdr:self.assertEqual((hdr[0]['kind'],hdr[0]['default']),('toggle','1'),platform)   # on by default (the host's own unset DM_HDR stays SDR)
+                if hdr:self.assertEqual((hdr[0]['kind'],hdr[0]['default']),('toggle','0'),platform)   # off by default, as the host's own unset DM_HDR (opt-in on this branch)
 
     def test_paper_white_and_peak_are_sub_settings_of_hdr_output(self):   # the console's HDR calibration: shown with HDR output, drawn only while it is on; defaults are the host's own (100; the peak automatic: hle_vi.c vi_hdr_peak), so an untouched row changes nothing
         ounce,nx=b'FS_ACCESS: { sdk_version: 20.5.19, spec: Ounce }',b'FS_ACCESS: { sdk_version: 12.0.0, spec: NX }'
