@@ -222,9 +222,9 @@ void nvn_dirty_open(const void *addr, size_t len) {
     pthread_mutex_lock(&g_slot_mu);
     g_nopen = 0;
     uintptr_t a = (uintptr_t)addr, e = a + len; int n = atomic_load(&g_nr);
-    // Take and hash every range before opening any page: adjacent pools can share
-    // a host page. Opening one first let a write reach its neighbour before that
-    // neighbour's hash, so the neighbour's before/after hashes missed the write.
+    // Every range's protected pages are hashed and taken before any page is opened, so each hash is of a read-only page: adjacent pools share their first / last host page, and opening one
+    // range's pages before hashing the next let a write to the shared page into that range's first hash, which then matched at the close (the write missed; t_dirty_race open_shared_page).
+    // The taken pages stay BUSY meanwhile: a fault or host write on one waits for the open below, and neither holds a BUSY page of its own while it waits
     for (int k = 0; len && k < n; k++) {
         range_t *r = rg(k);
         if (!live_at(k) || e <= r->base || a >= r->end) continue;
