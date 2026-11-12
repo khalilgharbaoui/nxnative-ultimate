@@ -17107,7 +17107,10 @@ void mtl_exec(const uint8_t *p) {
 }
 
 // ---------- Present: draw the swapchain texture to the CAMetalLayer; optional screenshot ----------
-static id<MTLRenderPipelineState> g_blit_pso, g_easu_pso, g_sharp_pso; static MTLPixelFormat g_blit_fmt;
+static id<MTLRenderPipelineState> g_blit_pso, g_easu_pso, g_sharp_pso, g_minify_pso; static MTLPixelFormat g_blit_fmt;
+// DM_PRESENT_MINIFY=1: a picture shown smaller than it is drawn is filtered over each pixel's footprint (present.metal minify, PR #2492); 0, the default on this branch, takes one
+// bilinear tap as before. A picture shown at its size or larger is drawn the same either way. Read once
+static int minify_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_PRESENT_MINIFY"); v = e && atoi(e) ? 1 : 0; if (v) MLOG("DM_PRESENT_MINIFY=1: a picture shown smaller than it is drawn is filtered over each pixel's footprint"); } return v; }
 // DM_SHARPEN=0..1: contrast adaptive sharpening of the presented picture (0 = off, the default). Read once
 static float sharpen_amount(void) {
     static float v = -1;
@@ -17633,6 +17636,9 @@ static void present_pipeline(MTLPixelFormat format) {
         pd.fragmentFunction = [lib newFunctionWithName:@"sharp"];
         g_sharp_pso = [g_dev newRenderPipelineStateWithDescriptor:pd error:&e];
         if (!g_sharp_pso) MLOG("[RED] present sharpening pipeline failed (%s); DM_SHARPEN does nothing", e.localizedDescription.UTF8String);
+        pd.fragmentFunction = [lib newFunctionWithName:@"minify"];
+        g_minify_pso = [g_dev newRenderPipelineStateWithDescriptor:pd error:&e];
+        if (!g_minify_pso) MLOG("[RED] present minifying pipeline failed (%s); DM_PRESENT_MINIFY takes one tap", e.localizedDescription.UTF8String);
         g_blit_fmt = format;
         MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new]; sd.minFilter = sd.magFilter = MTLSamplerMinMagFilterLinear; sd.supportArgumentBuffers = YES;
         g_blit_samp = [g_dev newSamplerStateWithDescriptor:sd];
@@ -17733,7 +17739,7 @@ static int present_encode(id<MTLCommandBuffer> cb, id<MTLTexture> src, id<MTLTex
     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
     id<MTLRenderCommandEncoder> en = [cb renderCommandEncoderWithDescriptor:rp];
     [en setViewport:vp];
-    [en setRenderPipelineState:g_blit_pso]; [en setFragmentTexture:present_raw_src(src) atIndex:0]; [en setFragmentSamplerState:g_blit_samp atIndex:0];
+    [en setRenderPipelineState:minify_on() && g_minify_pso ? g_minify_pso : g_blit_pso]; [en setFragmentTexture:present_raw_src(src) atIndex:0]; [en setFragmentSamplerState:g_blit_samp atIndex:0];
     float md = present_mode(src.pixelFormat, dst.pixelFormat);
     float uv[16] = {(float)cx / src.width, (float)cy / src.height, (float)cw / src.width, (float)ch / src.height,
                    (cx + 0.5f) / src.width, (cy + 0.5f) / src.height, (cx + cw - 0.5f) / src.width, (cy + ch - 0.5f) / src.height, md, present_white(md), 0, 0, 1, 1.0f / src.width, 1.0f / src.height, 0};   // the conversion; one tap, no sharpening: this pass draws as before
@@ -18173,7 +18179,7 @@ static int present_draw_m4(id<MTL4CommandBuffer> cb, id<MTLTexture> tex, const N
     [g_present_args setAddress:uvb.gpuAddress atIndex:0];
     [en setViewport:vp];
     // Sharpening replaces the box filter rather than following it: both read the same constants, so only the pipeline changes; FSR 1 (easu) does its own
-    [en setRenderPipelineState:easu ? g_easu_pso : (sharpen_amount() > 0 && g_sharp_pso) ? g_sharp_pso : g_blit_pso];
+    [en setRenderPipelineState:easu ? g_easu_pso : (sharpen_amount() > 0 && g_sharp_pso) ? g_sharp_pso : (minify_on() && g_minify_pso && taps <= 1) ? g_minify_pso : g_blit_pso];   // minify: one tap at its size or larger, so it takes the place of fs
     [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     m4_end(en);
     return 1;

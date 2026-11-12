@@ -227,6 +227,7 @@ t_present_crop: t_present_crop.m ../nvn/hle_nvn.c ../../host/crash.c ../../host/
 .PHONY: check_t_present_crop
 check_t_present_crop: t_present_crop
 	DM_PRESENT_SNAP=0 DM_NVN_ENC_THREAD=0 ./t_present_crop
+	DM_PRESENT_SNAP=0 DM_NVN_ENC_THREAD=0 DM_PRESENT_MINIFY=1 ./t_present_crop   # the minifying filter, off by default on this branch
 	DM_PRESENT_SNAP=0 DM_NVN_ENC_THREAD=1 ./t_present_crop
 	DM_PRESENT_SNAP=1 DM_NVN_ENC_THREAD=0 ./t_present_crop
 	DM_PRESENT_SNAP=1 DM_NVN_ENC_THREAD=1 ./t_present_crop
