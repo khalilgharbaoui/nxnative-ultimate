@@ -104,16 +104,16 @@ int main(int argc, char **argv) { @autoreleasepool {
     };
     for (size_t k = 0; k < sizeof cases / sizeof *cases; k++) {
         g_pass.cfmt[0] = cases[k].f; g_pass.cfmt[3] = cases[k].f;
-        CHECK(rop_word() == (on ? cases[k].cls | cases[k].cls << (3 * DMSH_BLEND_ROUND_BITS) : 0));
+        CHECK(rop_word(g_pso_lmap) == (on ? cases[k].cls | cases[k].cls << (3 * DMSH_BLEND_ROUND_BITS) : 0));
     }
     g_pass.cfmt[3] = 0; g_pass.cfmt[0] = MTLPixelFormatRGBA8Unorm;
-    S.color.blend_en = 1; S.blend[0] = state(2); CHECK(rop_word() == 0);   // a blended sum
-    S.blend[0].eq_rgb = MIN; S.blend[0].eq_a = MAX; CHECK(rop_word() == (on ? DMSH_ROUND_8 : 0u));   // MIN / MAX on both
-    S.blend[0].eq_a = ADD; CHECK(rop_word() == 0);   // the alpha blended
-    S.color.logic_op = NVN_LOGIC_OP_XOR; CHECK(rop_word() == (on ? DMSH_ROUND_8 : 0u));   // a logic operation takes the place of blending
+    S.color.blend_en = 1; S.blend[0] = state(2); CHECK(rop_word(g_pso_lmap) == 0);   // a blended sum
+    S.blend[0].eq_rgb = MIN; S.blend[0].eq_a = MAX; CHECK(rop_word(g_pso_lmap) == (on ? DMSH_ROUND_8 : 0u));   // MIN / MAX on both
+    S.blend[0].eq_a = ADD; CHECK(rop_word(g_pso_lmap) == 0);   // the alpha blended
+    S.color.logic_op = NVN_LOGIC_OP_XOR; CHECK(rop_word(g_pso_lmap) == (on ? DMSH_ROUND_8 : 0u));   // a logic operation takes the place of blending
     S.color.logic_op = NVN_LOGIC_OP_COPY; S.color.blend_en = 0;
     static const uint8_t lmap[8] = {0xff, 2, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}; g_pso_lmap = lmap;   // physical target 1 is output 2
-    g_pass.cfmt[0] = 0; g_pass.cfmt[1] = MTLPixelFormatRGBA16Unorm; CHECK(rop_word() == (on ? (uint32_t)DMSH_ROUND_16 << (2 * DMSH_BLEND_ROUND_BITS) : 0u));
+    g_pass.cfmt[0] = 0; g_pass.cfmt[1] = MTLPixelFormatRGBA16Unorm; CHECK(rop_word(g_pso_lmap) == (on ? (uint32_t)DMSH_ROUND_16 << (2 * DMSH_BLEND_ROUND_BITS) : 0u));
     g_pso_lmap = NULL;
     mtl_pool_del(commands); mtl_drain(); free(commands);
     printf("normalized colour rounding replay (%s): %d checks, %d failed\n", on ? "NVIDIA's rule" : "DM_NVN_ROP_ROUND=0, Apple's conversion", checks, failed);
