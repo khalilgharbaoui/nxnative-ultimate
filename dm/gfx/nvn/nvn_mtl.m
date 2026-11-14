@@ -8925,7 +8925,10 @@ static int pso4_on(void) {
 #endif
         // Metal cannot capture pipelines made from bases ("Capturing Render pipeline specialization is not supported"), and its Metal 4 → 3 conversion for the capture layer
         // crashes on the archives: a run that may capture GPU frames (DM_GPU_CAPTURE, MTL_CAPTURE_ENABLED) builds its pipelines through the MTLDevice
-        if (v && (getenv("DM_GPU_CAPTURE") || getenv("MTL_CAPTURE_ENABLED"))) { v = 0; MLOG("render pipelines through the MTLDevice in a run that may capture GPU frames (DM_GPU_CAPTURE / MTL_CAPTURE_ENABLED)"); }
+        // Empty or 0 asks for no capture (gpu_capture_frame takes frame 0 as none, and Metal reads MTL_CAPTURE_ENABLED=0 as off): those keep the Metal 4 path
+        const char *gc = getenv("DM_GPU_CAPTURE"), *mc = getenv("MTL_CAPTURE_ENABLED");
+        int cap = (gc && *gc && strcmp(gc, "0")) || (mc && *mc && strcmp(mc, "0"));
+        if (v && cap) { v = 0; MLOG("render pipelines through the MTLDevice in a run that may capture GPU frames (DM_GPU_CAPTURE / MTL_CAPTURE_ENABLED)"); }
     }
     return v;
 }
