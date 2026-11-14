@@ -105,6 +105,22 @@ int main(void) { @autoreleasepool {
         settle();
         CHECK(waiting() == 1, "its heap waits once the snapshot is freed");
     }
+    {   // the census's heaps line (heap_census): a large target's heap with its holders while a live object names it, while only its fence holds it, and waiting once it is freed
+        char line[1600];
+        tex_t big = target(&pool, 95008, 0, 2048, 2048); mtl_tex_init(&big);   // 32 MB: past the line's 16 MB
+        id<MTLTexture> tb = tex_mtl(&big); __weak id<MTLHeap> big_heap = tb.heap;
+        heap_census(line, sizeof line);
+        CHECK(tb.heap && strstr(line, " h [sa] 2048x2048x1"), "a live target's heap is listed with its texture, held by its serial and the sharing table");
+        if (!strstr(line, " h [sa] 2048x2048x1")) fprintf(stderr, "  heaps: %s\n", line);
+        tb = nil; mtl_tex_release(&big); mtl_alias_drop_pool(&pool);   // the pool goes: only the deferred release holds the texture until its submission completes
+        heap_census(line, sizeof line);
+        CHECK(strstr(line, " h [d] 2048x2048x1") != NULL, "once its pool is finalized, the deferred-release queue alone holds it");
+        if (!strstr(line, " h [d] 2048x2048x1")) fprintf(stderr, "  heaps: %s\n", line);
+        settle();
+        heap_census(line, sizeof line);
+        CHECK(big_heap && strstr(line, "[W] no texture known") != NULL, "freed, its heap waits in the recycled list with no texture");
+        if (!strstr(line, "[W] no texture known")) fprintf(stderr, "  heaps: %s\n", line);
+    }
     mtl_sub_commit(); mtl_drain(); free(mem);
     printf("t_rt_recycle: %d checks, %d failed\n", checks, failed); return failed != 0;
 } }

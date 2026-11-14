@@ -358,6 +358,7 @@ static int rh_mode(void) { static int m = -1; if (m < 0) m = sw_mode("DM_NVN_RT_
 // completion handler)
 static void rh_wait(id<MTLHeap> heap) {
     if (!heap) return;
+    if (heap.size >= (64u << 20)) MLOG("[mem] a recycled heap of %llu MB was let go by its texture (fence %llu, done %llu)", (unsigned long long)(heap.size >> 20), (unsigned long long)g_fence, (unsigned long long)g_done);   // when a load's largest target leaves
     if (!sw_on(rh_mode())) { res_remove(heap); return; }
     rh_ent e = {(void *)CFBridgingRetain(heap), heap.size, clock_gettime_nsec_np(CLOCK_MONOTONIC)};
     os_unfair_lock_lock(&g_rh_lk);
@@ -564,6 +565,26 @@ void mtl_res_stats(char *out, size_t n) {
 @implementation NvDeferredRelease @end
 static NSMutableArray<NvDeferredRelease *> *g_deferred;
 static pthread_mutex_t g_deferred_mu = PTHREAD_MUTEX_INITIALIZER;
+// A texture of 256 MB or more made (tex_mtl_): where its storage is, the fences, the large heaps still waiting for theirs, and a census of what the residency set holds, off this
+// thread and at most once a minute. A load that makes such a texture again (Ocarina of Time's 12288x12288 shadow target, alone in a 288 MB pool of its own, on some area loads) is
+// where the set peaks: the old one is still there beside the new, and the iPhone 17 was ended at that moment with nothing in its log saying what held the old one
+static void large_target_note(const tex_t *t, id<MTLTexture> mt) {
+    uint64_t dn = 0, db = 0, dmin = UINT64_MAX; unsigned long nq;
+    pthread_mutex_lock(&g_deferred_mu);
+    for (NvDeferredRelease *dr in g_deferred) { id o = dr->object; if (![o conformsToProtocol:@protocol(MTLTexture)]) continue; id<MTLHeap> h = ((id<MTLTexture>)o).heap;
+        if (h && h.size >= (64u << 20)) { dn++; db += h.size; if (dr->fence < dmin) dmin = dr->fence; } }
+    nq = (unsigned long)g_deferred.count;
+    pthread_mutex_unlock(&g_deferred_mu);
+    os_unfair_lock_lock(&g_rh_lk); unsigned rn = g_rh_n; uint64_t rb = g_rh_bytes; os_unfair_lock_unlock(&g_rh_lk);
+    MLOG("large texture ser=%llu: storage %p in pool %p (%llu MB, flags %#x), %s; fence %llu, done %llu; deferred-release queue %lu, with %llu heaps of 64 MB or more (%llu MB, the first behind fence %llu); recycled heaps waiting %u (%llu MB)",
+         (unsigned long long)t->serial, (void *)t->mem, (void *)(t->pool ? t->pool->mem : NULL), (unsigned long long)(t->pool ? t->pool->size >> 20 : 0), t->pool ? t->pool->flags : 0u,
+         mt.heap ? "in a heap of its own" : "its own allocation", (unsigned long long)g_fence, (unsigned long long)g_done, nq, (unsigned long long)dn, (unsigned long long)(db >> 20),
+         dmin == UINT64_MAX ? 0ull : (unsigned long long)dmin, rn, (unsigned long long)(rb >> 20));
+    static _Atomic uint64_t last; uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC), was = atomic_load(&last);
+    if (was && now - was < 60000000000ull) return;
+    if (!atomic_compare_exchange_strong(&last, &was, now)) return;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ @autoreleasepool { res_top("[mem] a texture of 256 MB or more was made"); mem_census("[mem] a texture of 256 MB or more was made"); } });
+}
 // Deferred release has two meanings that must be kept apart (the root of the GPU memory fault on the first frame on entering Travincal):
 //   defer_obj_release = this object is retired: drop the reference after the submissions that used it complete, and remove it from the residency set once no serial entry holds it (the owner's own_retire_locked);
 //   defer_obj_unref   = only the reference I hold is no longer wanted, the object itself may still be in use (the view cache of a texture ID may hold the base texture itself): only drop the reference, leave the residency set alone.
@@ -2764,6 +2785,11 @@ void mtl_alias_drop_pool(const void *pool) {
             if (k.pool == (uint64_t)(uintptr_t)pool) { alias_key *nk = realloc(ks, (ns + 1) * sizeof *ks); if (!nk) break; ks = nk; ks[ns++] = k; } }
         for (uint32_t i = 0; i < ns; i++) hm_del_id(&g_pkg_share, &ks[i]);
         free(ks); }
+    own_alias_each_locked(^(const alias_key *k, id o) {   // a large texture's last name going: when, and what still holds it (large_target_note says why)
+        if (k->pool != (uint64_t)(uintptr_t)pool || ![o conformsToProtocol:@protocol(MTLTexture)]) return; id<MTLTexture> t = o; uint64_t z = t.heap ? t.heap.size : t.allocatedSize;
+        if (z >= (64u << 20)) MLOG("[mem] pool %p finalized: its %lux%lu texture (%llu MB%s) leaves the sharing table; fence %llu, done %llu; held by a live serial %d, the finalized serials' ring %d, a pin %d",
+             pool, (unsigned long)t.width, (unsigned long)t.height, (unsigned long long)(z >> 20), t.heap ? " in a heap" : "", (unsigned long long)g_fence, (unsigned long long)g_done,
+             serial_table_holds((__bridge const void *)t), (entry_holds((__bridge const void *)t) && !serial_table_holds((__bridge const void *)t)), tex_object_pinned(t)); });
     own_alias_drop_pool_locked(pool);   // the sharing table's entries of the pool (nvn_owner.m; a new epoch: every texture ID takes the slow path once)
     pthread_mutex_unlock(&g_smu);
     // The pool's texture IDs are marked gone before their CPU-written classification goes: a pool walk (pool_gpu, holding g_rmu) reaching an ID in between found it not gone, the
@@ -4884,7 +4910,8 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct, int *in_storage) {
     }
     if (mt.allocatedSize >= (256u << 20)) { static int nb; if (nb++ < 20)   // the textures that take most of the GPU's memory (a GPU out-of-memory error says nothing of which)
         MLOG("large texture ser=%llu %ux%ux%u format %#x target %d levels %u: %llu MB%s", (unsigned long long)t->serial, t->d.width, t->d.height, t->d.depth, t->d.format, t->d.target, t->d.levels,
-             (unsigned long long)(mt.allocatedSize >> 20), t->pool && nvn_sparse_pool(t->pool) ? ", in a sparse virtual pool" : t->pool && (t->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL) ? ", in a virtual pool" : ""); }
+             (unsigned long long)(mt.allocatedSize >> 20), t->pool && nvn_sparse_pool(t->pool) ? ", in a sparse virtual pool" : t->pool && (t->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL) ? ", in a virtual pool" : "");
+        large_target_note(t, mt); }
     if (g_allocprof > 0) { static int n; if (n++ < 30 || n % 500 == 0) MLOG("new texture (%s) #%d ser=%llu %ux%ux%u format %#x target %d levels %u storage %p", __func__, n, (unsigned long long)t->serial, t->d.width, t->d.height, t->d.depth, t->d.format, t->d.target, t->d.levels, (void *)t->mem); }
     if (getenv("DM_NVN_TEXCPU") && t->pool && !(t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS)) MLOG("non-swizzled texture on a CPU-visible pool ser=%llu %ux%ux%u format %#x target %d levels %u texture flags %#x pool flags %#x storage %p", (unsigned long long)t->serial, t->d.width, t->d.height, t->d.depth, t->d.format, t->d.target, t->d.levels, t->d.flags, t->pool->flags, (void *)t->mem);
     res_add(mt);
@@ -18619,10 +18646,54 @@ void mtl_alloc_stats(uint64_t *waits, uint64_t *grown, int *n) { *waits = g_allo
 // deferred-release queue or nothing holds; and game textures at one storage address held as several Metal textures. Under no lock of the caller's
 static char census_flags_key;
 static id<MTLTexture> census_base(id in) { id o = [in isKindOfClass:[NvPkg class]] ? ((NvPkg *)in)->tex : in; if (![o conformsToProtocol:@protocol(MTLTexture)]) return nil; id<MTLTexture> t = o; return t.parentTexture ? t.parentTexture : t; }
+// The heaps of 16 MB and more in the residency set, the largest first: each with the texture placed in it and who holds that texture (s a live serial, g a finalized one, p a pin,
+// a the sharing table, d the deferred-release queue: submissions that may use it still running), W when the heap waits in the recycled list, and where its memory comes from (h a
+// recycled heap of its own, f a resolution family's heap). A placed texture's memory is its heap's, which the census's other lines leave out, and an area load's largest targets are
+// placed: the iPhone 17 was ended at Ocarina of Time's castle grounds with two 300 MB heaps in the set (its 12288x12288 shadow target, made again by the load, and the one it
+// replaced) and no line saying what still held the old one. The textures are found where anything names them and retained while they are read (mem_census says why)
+static void heap_census(char *out, size_t n) { @autoreleasepool {
+    NSMutableSet *keep = [NSMutableSet set], *deferred = [NSMutableSet set];
+    void (^add)(id o) = ^(id o) { id<MTLTexture> b = census_base(o); if (b) [keep addObject:b]; };
+    pthread_mutex_lock(&g_smu);
+    own_each_locked(^(uint64_t serial, id o, int ghost) { (void)serial; (void)ghost; add(o); });
+    own_alias_each_locked(^(const alias_key *k, id o) { (void)k; add(o); });
+    pthread_mutex_unlock(&g_smu);
+    os_unfair_lock_lock(&g_rmu);
+    for (int i = 1; i < g_ntreg; i++) { treg_t *r = &g_treg[i]; if (!r->ok) continue; void *vs[3] = {r->view, r->alt, r->im}; for (int k = 0; k < 3; k++) if (vs[k]) add((__bridge id)vs[k]); }
+    os_unfair_lock_unlock(&g_rmu);
+    pthread_mutex_lock(&g_deferred_mu); for (NvDeferredRelease *d in g_deferred) { id<MTLTexture> b = census_base(d->object); if (b) { [keep addObject:b]; [deferred addObject:b]; } } pthread_mutex_unlock(&g_deferred_mu);
+    NSMapTable *h2t = [NSMapTable mapTableWithKeyOptions:NSPointerFunctionsOpaqueMemory | NSPointerFunctionsOpaquePersonality valueOptions:NSPointerFunctionsStrongMemory];
+    for (id<MTLTexture> t in keep) { id<MTLHeap> h = t.heap; if (!h || h.size < (16u << 20)) continue; id<MTLTexture> was = [h2t objectForKey:h]; if (!was || t.allocatedSize > was.allocatedSize) [h2t setObject:t forKey:h]; }
+    NSHashTable *rh_waiting = [NSHashTable hashTableWithOptions:NSPointerFunctionsOpaqueMemory | NSPointerFunctionsOpaquePersonality];
+    os_unfair_lock_lock(&g_rh_lk); for (unsigned i = 0; i < g_rh_n; i++) [rh_waiting addObject:(__bridge id)g_rh[i].heap]; os_unfair_lock_unlock(&g_rh_lk);
+    NSMutableArray<id<MTLHeap>> *hs = [NSMutableArray array];
+    pthread_mutex_lock(&g_res_mu); for (id o in g_res_objects.allObjects) if ([o conformsToProtocol:@protocol(MTLHeap)] && ((id<MTLHeap>)o).size >= (16u << 20)) [hs addObject:o]; pthread_mutex_unlock(&g_res_mu);
+    [hs sortUsingComparator:^NSComparisonResult(id<MTLHeap> x, id<MTLHeap> y) { return x.size > y.size ? NSOrderedAscending : x.size < y.size ? NSOrderedDescending : NSOrderedSame; }];
+    NSUInteger nh = MIN(hs.count, (NSUInteger)12); char ks[12][16] = {{0}};
+    pthread_mutex_lock(&g_smu);
+    for (NSUInteger i = 0; i < nh; i++) { id t = [h2t objectForKey:hs[i]]; char *k = ks[i]; int o = 0; if (!t) continue; const void *p = (__bridge const void *)t;
+        if (serial_table_holds(p)) k[o++] = 's';
+        if (entry_holds(p) && !serial_table_holds(p)) k[o++] = 'g';
+        if (tex_object_pinned(t)) k[o++] = 'p';
+        if (own_shared_locked(t)) k[o++] = 'a';
+        k[o] = 0; }
+    pthread_mutex_unlock(&g_smu);
+    size_t ho = snprintf(out, n, "%lu", (unsigned long)hs.count);
+    for (NSUInteger i = 0; i < nh && ho < n; i++) { id<MTLHeap> h = hs[i]; id<MTLTexture> t = [h2t objectForKey:h]; char *k = ks[i]; size_t o = strlen(k);
+        if (t && [deferred containsObject:t]) k[o++] = 'd';
+        if ([rh_waiting containsObject:h]) k[o++] = 'W'; k[o] = 0;
+        if (!t) { ho += snprintf(out + ho, n - ho, "%s %llu MB [%s] no texture known", i ? ";" : ":", (unsigned long long)(h.size >> 20), k); continue; }
+        char m = objc_getAssociatedObject(t, &g_rh_owner_key) ? 'h' : objc_getAssociatedObject(t, &g_image_heap_owner_key) ? 'f' : '-';
+        ho += snprintf(out + ho, n - ho, "%s %llu MB %c [%s] %lux%lux%lu format %lu", i ? ";" : ":", (unsigned long long)(h.size >> 20), m, k,
+                       (unsigned long)t.width, (unsigned long)t.height, (unsigned long)MAX(t.depth, t.arrayLength), (unsigned long)t.pixelFormat); }
+} }
 void mem_census(const char *why) { @autoreleasepool {
     NSHashTable *named = [NSHashTable hashTableWithOptions:NSPointerFunctionsOpaqueMemory | NSPointerFunctionsOpaquePersonality];
     NSHashTable *named_ret = [NSHashTable hashTableWithOptions:NSPointerFunctionsOpaqueMemory | NSPointerFunctionsOpaquePersonality];   // named only through retired descriptors (until a live one names it)
-    #define CN_ADD(o) do { id<MTLTexture> b_ = census_base(o); if (b_) [named addObject:(__bridge id)(__bridge void *)b_]; } while (0)
+    // The textures met, retained: the tables here hold bare pointers, and a texture they name can be freed while the census runs on its own thread (a load's census read the size
+    // of one freed meanwhile and crashed in objc_msgSend). Retained until the census returns, every texture it reads stays valid
+    NSMutableSet *keep = [NSMutableSet set];
+    #define CN_ADD(o) do { id<MTLTexture> b_ = census_base(o); if (b_) { [named addObject:(__bridge id)(__bridge void *)b_]; [keep addObject:b_]; } } while (0)
     pthread_mutex_lock(&g_smu);
     void (^census_one)(id o) = ^(id o) { CN_ADD(o); if ([o isKindOfClass:[NvPkg class]] && ((NvPkg *)o)->spare) CN_ADD(((NvPkg *)o)->spare); };
     own_each_locked(^(uint64_t serial, id o, int ghost) { (void)serial; (void)ghost; census_one(o); });   // the serial tables (nvn_owner.m), then the sharing table
@@ -18635,14 +18706,14 @@ void mem_census(const char *why) { @autoreleasepool {
     uint64_t nreg = 0, nretired = 0;
     for (int i = 1; i < g_ntreg; i++) { treg_t *r = &g_treg[i]; if (!r->ok) continue; nreg++; nretired += r->retired;
         void *vs[7] = {r->view, r->alt, r->im, r->palt[0], r->palt[1], r->palt[2], r->palt[3]};
-        for (int k = 0; k < 7; k++) if (vs[k]) { id<MTLTexture> b = census_base((__bridge id)vs[k]); if (!b) continue; [r->retired ? named_ret : named addObject:(__bridge id)(__bridge void *)b];
+        for (int k = 0; k < 7; k++) if (vs[k]) { id<MTLTexture> b = census_base((__bridge id)vs[k]); if (!b) continue; [r->retired ? named_ret : named addObject:(__bridge id)(__bridge void *)b]; [keep addObject:b];
             if (k == 0 && r->t.mem) { const void *key = r->t.mem; NSHashTable *set = [by_mem objectForKey:(__bridge id)key];
                 if (!set) { set = [NSHashTable hashTableWithOptions:NSPointerFunctionsOpaqueMemory | NSPointerFunctionsOpaquePersonality]; [by_mem setObject:set forKey:(__bridge id)key]; }
                 [set addObject:(__bridge id)(__bridge void *)b];
                 if (![by_flags objectForKey:(__bridge id)key]) [by_flags setObject:@(((uint64_t)(r->t.pool && r->t.pool->magic == MAGIC('P', 'O', 'O', 'L') ? r->t.pool->flags : 0) << 32) | r->t.d.flags) forKey:(__bridge id)key]; } } }
     os_unfair_lock_unlock(&g_rmu);
     NSHashTable *waiting = [NSHashTable hashTableWithOptions:NSPointerFunctionsOpaqueMemory | NSPointerFunctionsOpaquePersonality];
-    pthread_mutex_lock(&g_deferred_mu); for (NvDeferredRelease *d in g_deferred) { id<MTLTexture> b = census_base(d->object); if (b) [waiting addObject:(__bridge id)(__bridge void *)b]; } pthread_mutex_unlock(&g_deferred_mu);
+    pthread_mutex_lock(&g_deferred_mu); for (NvDeferredRelease *d in g_deferred) { id<MTLTexture> b = census_base(d->object); if (b) { [waiting addObject:(__bridge id)(__bridge void *)b]; [keep addObject:b]; } } pthread_mutex_unlock(&g_deferred_mu);
     uint64_t small_n[2][2] = {{0}}, small_b[2][2] = {{0}};   // [texture][shared storage]: residency objects of 64 KB or less
     uint64_t n_ret = 0, b_ret = 0, n_named = 0, b_named = 0, n_wait = 0, b_wait = 0, n_none = 0, b_none = 0, n_buf = 0, b_buf = 0;
     enum { NF = 24 }; struct { unsigned long pf; uint64_t n, b; } fm[NF] = {{0}}; int nfm = 0;
@@ -18690,6 +18761,8 @@ void mem_census(const char *why) { @autoreleasepool {
       pthread_mutex_unlock(&g_mu);
       MLOG("%s census: memory pools looked up only by texture uploads %llu, %llu MB; by other uses only %llu, %llu MB; by both %llu, %llu MB; by nothing %llu, %llu MB", why,
            (unsigned long long)nb[0], (unsigned long long)(bb[0] >> 20), (unsigned long long)nb[1], (unsigned long long)(bb[1] >> 20), (unsigned long long)nb[3], (unsigned long long)(bb[3] >> 20), (unsigned long long)nb[2], (unsigned long long)(bb[2] >> 20)); }
+    { char hl[1600]; heap_census(hl, sizeof hl);
+      MLOG("%s census: heaps of 16 MB and more in the set, with the texture placed in each and its holders (s live serial, g finalized serial, p pin, a sharing table, d the deferred-release queue, W waiting in the recycled list): %s", why, hl); }
     #undef CN_ADD
 } }
 #include "nvn_capture.inc"   // DM_NVN_CAPTURE (one frame for dm/gfx/tests/nvn_replay)
