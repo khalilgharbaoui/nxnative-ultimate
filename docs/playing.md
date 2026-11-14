@@ -74,6 +74,8 @@ Joy-Con 2 and the Pro Controller 2 do not appear in macOS's Bluetooth settings: 
 
 **Checking a controller's gyro.** `scripts/sw2_gyro.sh` connects to a Switch 2 controller without a game, with the same driver, and prints its motion ten times a second as a game gets it: flat and still, the gyro reads within a few degrees per second of 0 and gravity about 1 G; turned, tens to hundreds of degrees per second. A window shows a block that turns as the controller does (blue: its face, orange: the triggers' edge; the space bar or Recenter turns it back to face the screen; `--no-window` prints only). Press a button on a paired controller, or hold Sync to pair one; quit any game first. macOS asks once for Bluetooth access for the terminal.
 
+**A character creeps with the stick let go?** In the game window, **Controller** › **Show Controller Window** (⌘⇧P) shows where the stick rests and calibrates it ([Switch 2 controllers](settings.md#switch-2-controllers)).
+
 The mouse pointer hides when you press a key or a controller button, or move a stick, while it is over the game picture. Moving the mouse shows it again, as does switching to another window or app.
 
 ## Shaders on first sight
