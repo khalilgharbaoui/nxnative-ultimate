@@ -54,3 +54,5 @@ tex_dirty_upload	on
 # The game submits a frame's commands behind an event its CPU signals once the frame before has left the GPU, so the GPU starts each frame with nothing queued and waits for the
 # replay: with Metal encoding on its own thread a GPU-bound Hyrule Field scene went 55.3-55.8 -> 56.5-56.9 fps (Apple M4 Pro, three runs a side, interleaved)
 enc_thread	on
+# Screen shape (patches.py): DM_SCREEN_ASPECT renders a screen taller than 16:9 in its own shape (16:10 on a MacBook, ~4:3 on an iPad) with the HUD at the screen's edges and 16:9's sides in view (more above and below)
+screen_aspect	on
