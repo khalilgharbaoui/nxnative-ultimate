@@ -210,7 +210,7 @@ static OSStatus au_render(void *ctx, AudioUnitRenderActionFlags *f, const AudioT
         pull_device(a, bl->mBuffers[0].mData, bl->mBuffers[0].mDataByteSize);
         int32_t g1 = atomic_load_explicit(&g_gain, memory_order_relaxed), g0 = a->gain_init ? a->gain_prev : g1;   // a fresh output starts at the current gain, not from silence
         a->gain_init = 1; a->gain_prev = g1;
-        uint32_t ch = (uint32_t)device_channels(a);
+        uint32_t ch = (uint32_t)a->dev_ch;   // the channels the device takes (PR #2303 named them device_channels, main keeps dev_ch)
         apply_gain(bl->mBuffers[0].mData, bl->mBuffers[0].mDataByteSize / (2u * ch), ch, g0, g1);
         if (a->mute) memset(bl->mBuffers[0].mData, 0, bl->mBuffers[0].mDataByteSize);
     }

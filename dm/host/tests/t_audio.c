@@ -85,7 +85,7 @@ static int test_master_volume(void) {
     static int16_t in[480 * 2], dst[480 * 2];
     for (int i = 0; i < 480 * 2; i++) in[i] = 20000;
     gbuf b = {in, sizeof in, sizeof in};
-    aout o = {.ch = 2};
+    aout o = {.ch = 2, .dev_ch = 2};   // as ao_open sets both (dev_ch: #2234's device channel count, which the gain walks)
     atomic_init(&o.state, STATE_STARTED); atomic_init(&o.vol, 0x3f800000u);
     AudioBufferList bl = {.mNumberBuffers = 1, .mBuffers = {{2, sizeof dst, dst}}};
     dm_audio_volume(0.5);
