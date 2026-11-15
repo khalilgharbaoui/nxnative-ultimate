@@ -16802,17 +16802,26 @@ static void sub_cut_begin(void) { g_cut_draw0 = g_stat_draw; }
 // DM_FSTEP_PROBE_RAMP=1 (default) / 0 / ab: a frame-step probe's grace is renewed while its frames keep getting cheaper (nvn_fstep.h FSTEP_RAMP), the time macOS's GPU clock takes to rise for the shorter deadline
 static int probe_ramp_mode(void) { static int m = -1; if (m < 0) m = sw_mode("DM_FSTEP_PROBE_RAMP", 1); return m; }
 int mtl_probe_ramp_on(void) { return sw_on(probe_ramp_mode()); }
+// A submission's first segment is cut after DM_NVN_CUT_FIRST_N draws (8) and committed even while earlier segments run (DM_NVN_CUT_FIRST=1, off by default on this branch, on in
+// PR #2526; ab for the DM_AB phases). A game that holds one frame in flight (Ocarina of Time waits on the fence of the frame it just submitted) gives the GPU nothing
+// at the frame boundary until a segment is committed, and the busy rule in sub_cut commits the next frame's first one only after the previous frame's last ran out: a Metal System
+// Trace on an M1 showed 0.4-3 ms of GPU idle there every frame. Committed early, the first segment runs while the previous frame's last finishes; Ocarina of Time on an M1: frames
+// 0.85 ms shorter
+static int cut_first(void) { static int m = -1; if (m < 0) { m = sw_mode("DM_NVN_CUT_FIRST", 0); if (m) MLOG("DM_NVN_CUT_FIRST=%d: a submission's first segment is committed early", m); } return m && sw_on(m); }
+static int cut_first_seg(void) { return g_seg == 0 && cut_first(); }
+static int cut_first_n(void) { static int fn = -1; if (fn < 0) { const char *e = getenv("DM_NVN_CUT_FIRST_N"); fn = e && atoi(e) > 0 ? atoi(e) : 8; } return fn; }
 // Whether a segment may end here, the pass aside: pass_split_try ends a pass only when the commit after it will be made
 static int sub_cut_ready(void) {
-    int n = cut_draws();
+    int n = cut_first_seg() ? cut_first_n() : cut_draws();
     return g_cb && (g_cut_copy || (n > 0 && g_stat_draw - g_cut_draw0 >= (uint64_t)n)) && !g_hoist_n && !g_defer_nact && !g_defer_pend && !g_fz.active && !g_rt_merged;
 }
 static void sub_cut(void) {
     if (g_enc || !sub_cut_ready()) return;
+    int first = cut_first_seg();   // DM_NVN_CUT_FIRST: the first segment commits even while earlier work runs
     // The cut is there so that the GPU does not sit idle while the host encodes. With earlier work still running a commit gains nothing and queues one more command buffer: each is a call into the kernel on Metal's one submission queue, and with buffers queued behind running work
     // the GPU waited 5-40 ms with the next one already committed (docs/reference/frame-rate.md). So it stays a boundary for the game's timestamps (ts_boundary), with the commit left for when the GPU has run out. A copy still commits, as its data must land. DM_NVN_CUT_BUSY=0: every cut commits
     static int busy = -1; if (busy < 0) { const char *e = getenv("DM_NVN_CUT_BUSY"); busy = !e || atoi(e) != 0; }
-    if (busy && !g_cut_copy && (!seg_ts() || ts_on()) && atomic_load_explicit(&g_seg_inflight, memory_order_relaxed) > 0) {
+    if (busy && !first && !g_cut_copy && (!seg_ts() || ts_on()) && atomic_load_explicit(&g_seg_inflight, memory_order_relaxed) > 0) {
         if (ts_on()) { ts_boundary(); g_seg++; }
         g_cut_draw0 = g_stat_draw; return; }
     if (g_tf_enc) tf_pass_end();
