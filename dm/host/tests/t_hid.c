@@ -65,6 +65,12 @@ void dm_gfx_passdump_next(long n) { (void)n; }
 void dm_gfx_addr_note(uint64_t a, char *note, size_t n) { (void)a; if (n) note[0] = 0; }   // DM_CTL "addr" (nvn_mtl.m)
 void dm_gfx_bufsnap(const char *key, uint64_t a, size_t n, const char *path) { (void)key; (void)a; (void)n; (void)path; }   // DM_CTL "bufsnap" (nvn_mtl.m)
 void probe_atrace(uint64_t lo, uint64_t n) { (void)lo; (void)n; }   // DM_CTL "atrace" (probe.c)
+// DM_CTL "cheat <name>", "cheats reload" (hle_cheats.c): not exercised here
+int dm_cheats_ncheats(void) { return 0; }
+const char *dm_cheat_name_at(int i) { (void)i; return ""; }
+int dm_cheat_on_at(int i) { (void)i; return 0; }
+void dm_cheat_toggle(int i) { (void)i; }
+void dm_cheats_reload(void) {}
 static int applet_depth, applet_opens, applet_closes_at_depth0;   // hle_oe.c: the applet stand-ins open and close their applet around the answer
 void dm_applet_enter(const char *name) { (void)name; applet_depth++; applet_opens++; }
 void dm_applet_leave(void) { applet_closes_at_depth0 += --applet_depth == 0; }
