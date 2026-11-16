@@ -44,7 +44,7 @@ class LauncherSettingsTests(unittest.TestCase):
             with self.subTest(api=api):
                 s = build(gid, api)['DM_PRESENT_UPSCALE']
                 self.assertEqual((s['kind'], s['section'], s['default']), ('choice', 'Game', 'off'))
-                self.assertEqual(s['options'], [['off', 'Standard'], ['metalfx', 'MetalFX']])
+                self.assertEqual(s['options'], [['off', 'Standard'], ['metalfx', 'MetalFX'], ['fsr', 'FSR 1']])
 
     def test_frame_buffering_by_graphics_api(self):
         for api, gid in [('nvn', BOTW), ('vulkan', '0100535012974000'), ('gl', '010014E00DB56000'), ('', BOTW)]:
@@ -72,15 +72,28 @@ class LauncherSettingsTests(unittest.TestCase):
         s = build(BOTW, 'nvn')['DM_SHOW_FPS']
         self.assertEqual((s['on'], s['off']), ('1', '0'))
 
+    def test_audio_limiter_is_a_game_toggle_for_every_game_off_unless_the_profile_says_on(self):   # the host reads DM_AUDIO_LIMIT as 1 / 0 (hle_audren.c)
+        for api, gid in [('nvn', BOTW), ('vulkan', '0100535012974000'), ('gl', '010014E00DB56000')]:
+            with self.subTest(api=api):
+                s = build(gid, api)['DM_AUDIO_LIMIT']
+                self.assertEqual((s['kind'], s['section'], s['on'], s['off'], s['default']), ('toggle', 'Game', '1', '0', '0'))
+
     def test_iphone_switches_only_on_the_iphone(self):   # touch feedback and the picture fit are the iOS front end's (DmGamepad.m, front_ios.m); the frame-rate counter is both's (front_mac.m too)
         ios, mac = build(BOTW, 'nvn'), build(BOTW, 'nvn', 'mac')
         self.assertEqual(build(BOTW, 'nvn', 'ios').keys(), ios.keys())   # ios when unset
         self.assertEqual(set(ios) - set(mac), {'DM_TOUCH_HAPTICS', 'DM_PICTURE_FIT'})
         self.assertIn('DM_SHOW_FPS', mac)
         self.assertIn('DM_RUMBLE', mac); self.assertIn('DM_METAL_HUD', mac)
-        self.assertEqual(set(mac) - set(ios), {'DM_FULLSCREEN', 'DM_SW2'})   # the Mac window's Display mode (front_mac.m reads 1 or 0); Switch 2 controllers (pad_switch2_apple.m, wired on the Mac only)
+        self.assertEqual(set(mac) - set(ios), {'DM_FULLSCREEN', 'DM_SW2', 'DM_FOCUS_PAUSE'})   # the Mac window's Display mode (front_mac.m reads 1 or 0); Switch 2 controllers (pad_switch2_apple.m, wired on the Mac only); Pause in the background (DM_FOCUS_PAUSE, front_mac.m)
         s = mac['DM_FULLSCREEN']
         self.assertEqual((s['kind'], s['default'], s['options'], s['level']), ('choice', '0', [['0', 'Window'], ['1', 'Fullscreen']], 'basic'))
+
+    def test_motion_controls_toggle_on_every_platform_and_api(self):   # hle_hid.c, motion_apple.h and DmGamepad.m take DM_MOTION=0 as off, anything else or unset as on
+        for api, gid, platform in [('nvn', BOTW, 'ios'), ('nvn', BOTW, 'mac'), ('vulkan', '0100535012974000', 'mac'), ('gl', '010014E00DB56000', 'ios')]:
+            with self.subTest(api=api, platform=platform):
+                s = build(gid, api, platform)['DM_MOTION']
+                self.assertEqual((s['kind'], s['section'], s['label'], s['default'], s['on'], s['off']), ('toggle', 'Controls', 'Motion controls', '1', '1', '0'))
+                self.assertFalse({'level', 'needs'} & set(s))
 
     def test_defaults_follow_each_platform_host(self):
         # nvn_mtl.m pso4_on: Mac defaults on, iOS follows the profile. nvn_rec.h rec_on: iOS on, Mac off.

@@ -10,7 +10,7 @@
 //      The local SDK uses a different command format whose storage can exceed the service's budget; that backend storage is supplied by the host. Explicit CPU renderers keep the SDK contract;
 //   2. A render thread (a guest thread started by the host): renders one frame whenever the output hands back a 5 ms buffer, so pacing follows the sound card clock;
 //   3. Takes over AudioRendererImpl::ExecuteAudioRendererRendering (reached through the PLT): generates commands and runs CommandListProcessor like the original,
-//      then finds the DeviceSink command in the command list (a no-op for the CPU processor) and clamps its input mix buffers (int32 holding 16-bit range) to int16 stereo for AudioOut (hle_audio.c).
+//      then finds the DeviceSink command in the command list (a no-op for the CPU processor) and clamps its input mix buffers (int32 holding 16-bit range) to int16 stereo for AudioOut (hle_audio.c; a peak limiter first when audio_limit / DM_AUDIO_LIMIT asks for one).
 // Command list format (SDK 16): header +0x04 command count, +0x08 mix buffer address, +0x10 buffer count, +0x14 samples per frame, +0x18 sample rate, commands from +0x20;
 //   each command +0x00 magic 0xcafebabe, +0x04 enabled, +0x05 command ID (DeviceSink = 0x13), +0x06 size; DeviceSink +0x128 upsampler buffer, +0x130 input count, +0x134 input indices (s16).
 #include "hle.h"
@@ -89,19 +89,22 @@ HLE_FORCE("_ZN2nn5audio30GetAudioRendererWorkBufferSizeERKNS0_22AudioRendererPar
 // globals: a second renderer's updates rendered catch-up frames into the first one's output queue, about 10% of its frames (Mario & Luigi: Brothership), and its own frames were never rendered otherwise
 enum { CQ = 4, AR_MAX = 4 };   // AR_MAX as g_rev below
 typedef struct { void *ptr; uint64_t cap, size; } gbuf;       // same as the front of hle_audio.c's AudioOutBuffer
+typedef struct { double dip, held; uint32_t left; } lim_t;   // limit_stereo's state: the gain's reduction (gain = 1 - dip), and the hold of a peak at the end of the last call: gain held for left more frames
 typedef struct {
     void *handle[2];                         // AudioRendererHandle (renderer object, client state); handle[0] NULL: a free slot
     uint8_t *sys;                            // its AudioRenderSystem, from its first render or update (ar_of_sys)
     _Atomic int open;
     void *render_tt;                         // the render thread (ThreadType from dm_guest_thread_spawn): Close joins it before the SDK tears the renderer down
-    int16_t frame[FRAME_MAX * 2]; int frame_n;   // the latest frame (stereo int16)
+    int oc;                                  // output channels: 6 on a six-channel route, else 2 (dm_audio_route when the renderer opened)
+    int16_t frame[FRAME_MAX * 6]; int frame_n;   // the latest frame (oc interleaved int16 channels per sample)
     _Atomic uint64_t frames, nonsilent, updates, renders, catchups;
     uint64_t last_r; int updated;            // the render count at the last update, once there was one
-    int16_t cq[CQ][FRAME_MAX * 2]; int cq_n[CQ]; _Atomic uint32_t cq_head, cq_tail;   // output queue of catch-up frames
+    int16_t cq[CQ][FRAME_MAX * 6]; int cq_n[CQ]; _Atomic uint32_t cq_head, cq_tail;   // output queue of catch-up frames
     pthread_mutex_t cq_mu; pthread_cond_t cq_cv;   // the render thread signals each frame it takes off the queue (catch-up pacing)
     int sink_logged;
-    int32_t up_buf[2 * (15 + FRAME_MAX)]; uint32_t up_pos;   // up_3_2's last samples and position
-    int16_t pcm[NBUF][FRAME_MAX * 2]; gbuf bufs[NBUF];   // the blocks its output plays from: AudioOut queues only the pointer and copies the samples when the sound card asks (issue #1336)
+    int32_t up_buf[6 * (15 + FRAME_MAX)]; uint32_t up_pos;   // up_3_2's last samples and position
+    int16_t pcm[NBUF][FRAME_MAX * 6]; gbuf bufs[NBUF];   // the blocks its output plays from (oc channels): AudioOut queues only the pointer and copies the samples when the sound card asks (issue #1336)
+    lim_t lim;                               // the output limiter's state (limit_stereo); a cleared slot starts at unity with no hold
 } ar_t;
 static ar_t g_ar[AR_MAX];
 static pthread_mutex_t g_ar_mu = PTHREAD_MUTEX_INITIALIZER;   // the slots' handle and sys fields
@@ -122,10 +125,12 @@ static ar_t *ar_of_sys(uint8_t *sys) {
     return found;
 }
 
+static int ar_oc(const ar_t *a) { return a->oc == 6 ? 6 : 2; }   // the renderer's output channels; one not opened by ar_open (no route read) is stereo
 static void render_main(void *arg) {
     ar_t *a = arg; t_ar = a;
     void (*exec)(void *, void *) = gsym("_ZN2nn5audio29ExecuteAudioRendererRenderingENS0_19AudioRendererHandleE");
-    void *out = dm_pcmout_open(2);
+    const int oc = ar_oc(a);
+    void *out = dm_pcmout_open(oc);
     gbuf *free_list[NBUF]; int nfree = NBUF;
     for (int i = 0; i < NBUF; i++) { a->bufs[i] = (gbuf){a->pcm[i], sizeof a->pcm[i], 0}; free_list[i] = &a->bufs[i]; }
     dm_pcmout_start(out);
@@ -144,8 +149,9 @@ static void render_main(void *arg) {
         else { a->frame_n = 0; exec(a->handle[0], a->handle[1]); src = a->frame; got = a->frame_n; }   // SDK: generate commands → CPU processing (output taken in the host takeover) → signal the game's renderer event
         int n = got ? got : 240;
         gbuf *b = free_list[--nfree];
-        if (got) memcpy(b->ptr, src, (size_t)n * 4); else memset(b->ptr, 0, (size_t)n * 4);
-        b->size = (uint64_t)n * 4;
+        size_t bytes = (size_t)n * oc * 2;
+        if (got) memcpy(b->ptr, src, bytes); else memset(b->ptr, 0, bytes);
+        b->size = bytes;
         if (!dm_pcmout_append(out, b)) free_list[nfree++] = b;
     }
     dm_pcmout_close(out);   // the output would otherwise keep its sound card callback or silent sink running and hold one of the AudioOut slots after the renderer closes
@@ -239,13 +245,14 @@ static Result ar_open(void **handle, void *ev, const uint8_t *param, void *work,
     pthread_mutex_unlock(&g_ar_mu);
     LOG("audren: renderer %d opened from %s+%#llx", a ? ar_index(a) : -1, m ? m->name : "host", m ? (unsigned long long)((uint8_t *)ra - m->base) : 0ULL);
     if (!a) { LOG("[RED] audren: more than %d renderers: this one is not rendered", AR_MAX); return r; }
+    a->oc = dm_audio_route();
     a->render_tt = dm_guest_thread_spawn(render_main, a, 9, 0x10000);
     return r;
 }
 HLE_FORCE("_ZN2nn5audio17OpenAudioRendererEPNS0_19AudioRendererHandleEPNS_2os11SystemEventERKNS0_22AudioRendererParameterEPvm", "open the renderer (with event): CPU rendering + manual execution, the host starts a render thread",
-          Result, h_ar_Open, void **handle, void *ev, const uint8_t *param, void *work, size_t sz) { return ar_open(handle, ev, param, work, sz, __builtin_return_address(0)); }
+          Result, h_ar_Open, void **handle, void *ev, const uint8_t *param, void *work, size_t sz) { return ar_open(handle, ev, param, work, sz, dm_bigstack_caller(__builtin_return_address(0))); }
 HLE_FORCE("_ZN2nn5audio17OpenAudioRendererEPNS0_19AudioRendererHandleERKNS0_22AudioRendererParameterEPvm", "open the renderer (no event): CPU rendering + manual execution, the host starts a render thread",
-          Result, h_ar_Open0, void **handle, const uint8_t *param, void *work, size_t sz) { return ar_open(handle, NULL, param, work, sz, __builtin_return_address(0)); }
+          Result, h_ar_Open0, void **handle, const uint8_t *param, void *work, size_t sz) { return ar_open(handle, NULL, param, work, sz, dm_bigstack_caller(__builtin_return_address(0))); }
 HLE_FORCE("_ZN2nn5audio18CloseAudioRendererENS0_19AudioRendererHandleE", "close the renderer: stop the host render thread first, then hand over to the SDK", void, h_ar_Close, void *obj, void *state) {
     static void (*orig)(void *, void *); if (!orig) orig = gsym("_ZN2nn5audio18CloseAudioRendererENS0_19AudioRendererHandleE");
     // Join the render thread first (it checks open every round and at most every 10 ms while waiting for the output): it may be inside exec(), which uses the renderer the SDK is about to free.
@@ -307,7 +314,7 @@ HLE_FORCE("_ZN2nn5audio6server16UpsamplerManager8AllocateEv", "upsampler for a D
     return mgr ? orig(mgr) : NULL;
 }
 enum { RS_T = 16 };
-static uint32_t up_3_2(ar_t *a, const int32_t *in, uint32_t n, int32_t *out) {
+static uint32_t up_3_2(ar_t *a, const int32_t *in, uint32_t n, int32_t *out, int nch) {   // nch interleaved channels
     static float h[3][RS_T]; int32_t *buf = a->up_buf; uint32_t pos = a->up_pos;   // pos: the next output's position in thirds of an input sample, from the frame start
     if (!h[0][RS_T / 2 - 1]) {
         for (int p = 0; p < 3; p++) {
@@ -320,18 +327,65 @@ static uint32_t up_3_2(ar_t *a, const int32_t *in, uint32_t n, int32_t *out) {
             for (int k = 0; k < RS_T; k++) h[p][k] = (float)(w[k] / sum);
         }
     }
-    memcpy(buf + 2 * (RS_T - 1), in, (size_t)n * 8);   // the frame after the last RS_T - 1 samples of the one before (copied first: out may be in)
+    memcpy(buf + nch * (RS_T - 1), in, (size_t)n * nch * 4);   // the frame after the last RS_T - 1 samples of the one before (copied first: out may be in)
     uint32_t m = 0;
     for (; pos < 3 * n; pos += 2, m++) {
-        const int32_t *x = buf + 2 * (pos / 3); const float *c = h[pos % 3]; float l = 0, r = 0;
-        for (int k = 0; k < RS_T; k++) { l += c[k] * (float)x[2 * k]; r += c[k] * (float)x[2 * k + 1]; }
-        out[2 * m] = (int32_t)lrintf(l); out[2 * m + 1] = (int32_t)lrintf(r);
+        const int32_t *x = buf + nch * (pos / 3); const float *c = h[pos % 3];
+        for (int j = 0; j < nch; j++) {
+            float v = 0;
+            for (int k = 0; k < RS_T; k++) v += c[k] * (float)x[nch * k + j];
+            out[nch * m + j] = (int32_t)lrintf(v);
+        }
     }
     a->up_pos = pos - 3 * n;
-    memmove(buf, buf + 2 * n, (RS_T - 1) * 8);
+    memmove(buf, buf + nch * n, (RS_T - 1) * nch * 4);
     return m;
 }
-static int capture(ar_t *a, const uint8_t *cl, size_t len, int16_t *dst) {
+// Whether the output limiter is on (profile audio_limit, DM_AUDIO_LIMIT=1 / 0 overrides), read once: capture runs under g_render_mu. A game that mixes every voice at 1.0 passes int16 by up to 4 dB (Axiom Verge 1.0.3) and the clamp
+// below flat-tops its peaks, heard as crackle; the console clamps the same way, so this is an enhancement and off by default
+static int audio_limit_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("DM_AUDIO_LIMIT"); on = e ? atoi(e) > 0 : DM_GAME_AUDIO_LIMIT;
+        if (on) LOG("audren: output limiter on (%s)", e ? "DM_AUDIO_LIMIT" : "game profile audio_limit");
+    }
+    return on;
+}
+// Peak limiter over interleaved stereo (int32 at the output rate), in place: peaks are turned down before they reach the ceiling, not flat-topped at it. One gain for both channels (the stereo image holds) with a lookahead of 1 ms (L frames)
+// inside the block it is given, so no latency is added: the renderer hands over the whole 5 ms block. Each frame needs a gain of at most req = 32767 / its larger channel. req is held over the L - 1 frames before it and after it
+// (after, so the gain does not start to recover before the peak has passed), and the gain ramps down to that hold by at most 1 / L per frame, so it is already low when the peak arrives. The gain returns to 1.0
+// exponentially (50 ms time constant), the lower of the two being used. Only the lookahead before a peak stops at a block's start (the block before is already output): an overshoot in a block's first L frames meets a steeper ramp.
+// The hold after a peak runs on into the next call (lm->left frames at the gain lm->held; the lowest gain and the longest time of the peaks near the end, a little more than each alone needs). A longer call runs in blocks of FRAME_MAX.
+// The state also has the gain's reduction, dip = 1 - gain, 0 at unity: a mix under the ceiling with dip 0 and no hold left is not touched, and a release below half an LSB of full scale snaps to 0 (so unity is reached exactly,
+// and the output is again bit-identical to the unlimited one). The gain never exceeds req and stays positive: no sample passes the ceiling, no sign flips. The caller's clamp stays as the safety net
+static void limit_stereo(lim_t *lm, int32_t *st, uint32_t frames, uint32_t rate) {
+    const double ceil_ = 32767, release = exp(-1.0 / (0.05 * rate)); const uint32_t look = rate / 1000 ? rate / 1000 : 1;
+    static double env[FRAME_MAX]; double g = 1 - lm->dip, held = lm->held;   // env: the gain each frame may have at most, from its own and the coming frames' peaks; static like capture's st (8 KB, and the render thread has 64 KB of stack; capture runs under g_render_mu)
+    uint32_t left = lm->left;
+    for (uint32_t n; frames; frames -= n, st += 2 * n) {
+        n = frames < FRAME_MAX ? frames : FRAME_MAX;
+        for (uint32_t s = 0; s < n; s++) env[s] = s < left ? held : 1;   // the hold of the peaks before this block
+        double next = 1; uint32_t next_left = left > n ? left - n : 0;   // and what of the holds reaches past its end
+        if (next_left) next = held;
+        for (uint32_t s = 0; s < n; s++) {
+            double pk = fmax(fabs((double)st[2 * s]), fabs((double)st[2 * s + 1]));
+            if (pk <= ceil_) continue;
+            double req = ceil_ / pk;
+            for (uint32_t j = s >= look ? s - look + 1 : 0; j < n && j < s + look; j++) if (req < env[j]) env[j] = req;   // the hold: look - 1 frames either side of s
+            if (s + look > n) { if (req < next) next = req; if (s + look - n > next_left) next_left = s + look - n; }
+        }
+        for (uint32_t s = n; s-- > 1;) if (env[s] + 1.0 / look < env[s - 1]) env[s - 1] = env[s] + 1.0 / look;
+        for (uint32_t s = 0; s < n; s++) {
+            g = 1 - (1 - g) * release; if (1 - g < 1.0 / 65536) g = 1;
+            if (env[s] < g) g = env[s];
+            if (g != 1) { st[2 * s] = (int32_t)lrint(st[2 * s] * g); st[2 * s + 1] = (int32_t)lrint(st[2 * s + 1] * g); }
+        }
+        held = next; left = next_left;
+    }
+    lm->dip = 1 - g; if (lm->dip < 1.0 / 65536) lm->dip = 0;
+    lm->held = held; lm->left = left;
+}
+static int capture(ar_t *a, const uint8_t *cl, size_t len, int16_t *dst) {   // writes a->oc channels per sample
     if (len < 0x20) return 0;
     uint32_t ncmd = *(const uint32_t *)(cl + 4), samples = *(const uint32_t *)(cl + 0x14), rate = *(const uint32_t *)(cl + 0x18);
     const int32_t *mix = *(const int32_t *const *)(cl + 8); const uint8_t *cend = cl + len;
@@ -397,17 +451,25 @@ static int capture(ar_t *a, const uint8_t *cl, size_t len, int16_t *dst) {
             for (uint32_t j = 0; j < k; j++) ch[j] = mix + (size_t)in[j] * samples;
             // Channel order front-left front-right center LFE back-left back-right; 6 → 2 with the system default downmix coefficients (front 1.0, center 0.707, LFE 0.251, back 0.707, Q15)
             enum { CF = 32768, CC = 23167, CL = 8224, CB = 23167 };
-            static int32_t st[FRAME_MAX * 2];   // the stereo downmix before clamping (capture runs under g_render_mu)
+            static int32_t st[FRAME_MAX * 6];   // the output before clamping, a->oc channels per sample (capture runs under g_render_mu)
+            const int oc = ar_oc(a);
             for (uint32_t s = 0; s < samples; s++) {
+                if (oc == 6) {   // the six channels as the sink names them; a sink of fewer plays its front pair as on stereo (mono on both), and the other four are silent
+                    if (k >= 6) for (uint32_t j = 0; j < 6; j++) st[6 * s + j] = ch[j][s];
+                    else { st[6 * s] = ch[0][s]; st[6 * s + 1] = k > 1 ? ch[1][s] : ch[0][s]; for (uint32_t j = 2; j < 6; j++) st[6 * s + j] = 0; }
+                    continue;
+                }
+                // Stereo: 6 → 2 with the system default downmix coefficients (front 1.0, center 0.707, LFE 0.251, back 0.707, Q15)
                 int32_t l, r;
                 if (k >= 6) { int64_t c = (int64_t)ch[2][s] * CC + (int64_t)ch[3][s] * CL;
                               l = (int32_t)(((int64_t)ch[0][s] * CF + c + (int64_t)ch[4][s] * CB) >> 15); r = (int32_t)(((int64_t)ch[1][s] * CF + c + (int64_t)ch[5][s] * CB) >> 15); }
                 else { l = ch[0][s]; r = k > 1 ? ch[1][s] : l; }
                 st[2 * s] = l; st[2 * s + 1] = r;
             }
-            uint32_t nout = rate == 48000 ? samples : up_3_2(a, st, samples, st);
+            uint32_t nout = rate == 48000 ? samples : up_3_2(a, st, samples, st, oc);
+            if (audio_limit_on() && oc == 2) limit_stereo(&a->lim, st, nout, 48000);   // the limiter is stereo: a six-channel output (#2234) keeps the clamp
             uint64_t loud = 0;
-            for (uint32_t s = 0; s < 2 * nout; s++) {
+            for (uint32_t s = 0; s < nout * oc; s++) {
                 int32_t v = st[s]; v = v > 32767 ? 32767 : v < -32768 ? -32768 : v;
                 dst[s] = (int16_t)v; loud |= (uint64_t)v;
             }
@@ -584,7 +646,7 @@ HLE_FORCE("_ZN2nn5audio30GetActiveAudioOutputDeviceNameEPNS0_15AudioDeviceNameE"
 // The SDK 12 names (Engage): the same service, the same answers
 HLE_FORCE("_ZN2nn5audio19ListAudioDeviceNameEPNS0_15AudioDeviceNameEi", "output device list (SDK 12 name): 1 built-in speaker", int, h_ad_List12, char *names, int n) { return h_ad_List(names, n); }
 HLE_FORCE("_ZN2nn5audio24GetActiveAudioDeviceNameEPNS0_15AudioDeviceNameE", "active output device (SDK 12 name): built-in speaker", void, h_ad_Active12, char *name) { out_devname(name); }
-HLE_FORCE("_ZN2nn5audio41GetActiveAudioDeviceChannelCountForOutputEv", "output channel count: 2", int, h_ad_Channels, void) { return 2; }
+HLE_FORCE("_ZN2nn5audio41GetActiveAudioDeviceChannelCountForOutputEv", "output channel count: the route's (6 on a six-channel device, else 2)", int, h_ad_Channels, void) { return dm_audio_route(); }
 // Device volume: kept and read back (DRAGON QUEST VII Reimagined reads it at boot, main+0xee8edc), not applied: the host's output has the system's own volume
 static _Atomic float g_dev_vol = 1.0f;
 HLE_FORCE("_ZN2nn5audio26SetAudioDeviceOutputVolumeEPKNS0_15AudioDeviceNameEf", "device volume; kept for the getter, not applied by the host", void, h_ad_SetVol, const char *name, float v) { (void)name; atomic_store(&g_dev_vol, v); }
@@ -603,6 +665,15 @@ HLE_FORCE("_ZN2nn5audio39AcquireAudioDeviceNotificationForOutputEPNS_2os11System
 // start (main+0xe7b9c): unserved, its user session with aud:u aborted (Result 0xe15). That sdk's version (sdk+0x1f1e00) keeps no per-process flag and attaches the event AutoClear;
 // the two differ only on a second acquire (0x499 here), which no game has been seen to make
 HLE_FORCE("_ZN2nn5audio36AcquireAudioOutputDeviceNotificationEPNS_2os11SystemEventE", "output device change notification (SDK 21 name): bound, never signaled", Result, h_ad_Notify21, void *ev) { return h_ad_Notify(ev); }
+// Its release (Nintendo Switch Sports Resort, main+0x3af119c). The SDK's (sdk+0x1f2ac0) asks aud:u through the device session coordinator (unserved: it would abort as the acquire did),
+// then destroys the event; the game destroys the event itself only if it is still initialized afterwards (main+0x3af11a0). The host destroys the event it bound, which drops the
+// binding, and clears the flag so a later acquire binds again; with nothing acquired there is nothing to destroy. Returns nothing (the SDK aborts on a failed release)
+HLE_FORCE("_ZN2nn5audio36ReleaseAudioOutputDeviceNotificationEPNS_2os11SystemEventE", "release the output device change notification (SDK 21 name): the event is destroyed",
+          void, h_ad_NotifyRelease21, void *ev) {
+    if (!atomic_exchange(&g_ad_notify, 0)) return;
+    static void (*destroy)(void *); if (!destroy) destroy = gsym("_ZN2nn2os18DestroySystemEventEPNS0_15SystemEventTypeE");
+    destroy(ev);
+}
 // The input twin (Portal 2's main+0x19f37c, on its audio thread at start): the same shape with a flag of its own (SDK 13.3.0 sdk+0x56300: +0x851, the output's +0x852)
 static atomic_int g_ad_notify_in;
 HLE_FORCE("_ZN2nn5audio38AcquireAudioDeviceNotificationForInputEPNS_2os11SystemEventE", "input device change notification: bound, never signaled (the host has no microphone)", Result, h_ad_NotifyIn, void *ev) {
@@ -611,4 +682,4 @@ HLE_FORCE("_ZN2nn5audio38AcquireAudioDeviceNotificationForInputEPNS_2os11SystemE
 }
 // SDK 7 names of the two above (Super Mario Odyssey): the device-switch event and the active channel count
 HLE_FORCE("_ZN2nn5audio36AcquireAudioDeviceSwitchNotificationEPNS_2os11SystemEventE", "output device switch notification (SDK 7 name): bound, never signaled", void, h_ad_Notify7, void *ev) { hle_bind_system_event(ev, 0); }
-HLE_FORCE("_ZN2nn5audio21GetActiveChannelCountEv", "output channel count (SDK 7 name): 2", int, h_ad_Channels7, void) { return 2; }
+HLE_FORCE("_ZN2nn5audio21GetActiveChannelCountEv", "output channel count (SDK 7 name): the route's", int, h_ad_Channels7, void) { return dm_audio_route(); }

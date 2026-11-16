@@ -4,8 +4,11 @@ Exercise the builder's real key/restore functions without game files or Xcode.
 import ast
 import collections
 import concurrent.futures as cf
+import contextlib
+import errno
 import hashlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -39,7 +42,7 @@ class ShaderCache(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
         root = Path(self.tmp.name)
-        self.ns: dict[str, Any] = dict(hashlib=hashlib, os=os, json=json, re=re, threading=threading,
+        self.ns: dict[str, Any] = dict(hashlib=hashlib, os=os, sys=sys, json=json, re=re, threading=threading,
                        subprocess=subprocess, dmsh_chain=dmsh_chain, SPIRV_CROSS='converter',
                        XC=['--msl'], MAC_RECORD='mac flags', IOSOUT=None, TARGETS={'mac'},
                        ios_metal=types.SimpleNamespace(RECORD='ios flags'), METAL_FP='tested Metal and SDK',
@@ -267,6 +270,18 @@ class ShaderCache(unittest.TestCase):
         self.assertEqual(sorted(p.name for p in img.iterdir()), sorted([a + '_b.metal', a + '_b.metallib', b + '_b.metal', b + '_b.metallib', 'inputs.tsv']))
         self.assertEqual((img / (a + '_b.metallib')).read_bytes(), a.encode())
 
+    def test_a_stage_the_cache_cannot_take_leaves_every_file_on_disk(self):   # a full drive: the stage's batch is rolled back, earlier writes too, so none of its files may go
+        out, key = Path(self.ns['out']), '1' * 16
+        (out / (key + '_b.json')).write_text('{}'); (out / (key + '_b.metallib')).write_bytes(b'x' * 200000)
+        store = self.ns['STORE']; store.put('before', b'0')
+        n = store.db.execute('PRAGMA page_count').fetchone()[0]; store.db.execute(f'PRAGMA max_page_count={n + 2}')
+        with mock.patch('builtins.print'): self.ns['commit'](key)
+        self.assertTrue(store.full); self.assertEqual(store.names('stage/'), set())
+        self.assertEqual(sorted(p.name for p in out.iterdir()), [key + '_b.json', key + '_b.metallib'])
+        (out / 'inputs.tsv').write_text('game\tid\ninputs\tinputs\n')
+        self.ns['publish_library']('mac')
+        self.assertEqual(sorted(p.name for p in shader_lib.view(out).iterdir()), sorted([key + '_b.json', key + '_b.metallib', 'inputs.tsv']))
+
     def test_partial_build_keeps_the_image_less_the_keys_it_builds(self):
         out, built, kept = Path(self.ns['out']), '1' * 16, '2' * 16
         shader_lib.write({built + '_b.metal': b'old', built + '_bf.metallib': b'old variant', kept + '_b.metal': b'kept', 'inputs.tsv': b'game\tid\ninputs\told\n'},
@@ -286,6 +301,29 @@ class ShaderCache(unittest.TestCase):
         self.ns['publish_library']('mac')
         self.assertEqual((out / (key + '_b.metal')).read_text(), 'source')
         self.assertFalse(os.path.exists(shader_lib.image_of(str(out))))
+
+    def test_full_disk_during_folder_restore_exits_once_and_keeps_stage(self):
+        out, key = Path(self.ns['out']), '1' * 16
+        (out / (key + '_b.metal')).write_text('source')
+        self.ns['commit'](key)
+        store = self.ns['STORE']
+        for name, data in ((key + '_b.metal', b'source'), (key + '_b.json', b'{"chain":"old"}'), (key + '_b.metallib', b'compiled')):
+            store.put(f'shader/d/mac/{name}', data)
+        self.ns['shader_lib'] = types.SimpleNamespace(image_of=shader_lib.image_of, write=mock.Mock(side_effect=OSError(errno.ENOSPC, 'No space left on device')))
+        output = io.StringIO()
+        with mock.patch.object(store, 'to_file', side_effect=OSError(errno.ENOSPC, 'No space left on device')):
+            with contextlib.redirect_stdout(output):
+                with self.assertRaises(SystemExit) as raised: self.ns['publish_library']('mac')
+        self.assertNotEqual(raised.exception.code, 0)
+        self.assertEqual(output.getvalue().count('[RED] could not write'), 1)   # the image's line, then the stop's
+        self.assertEqual(str(raised.exception.code).count('[RED]'), 1)
+        self.assertIn(str(out), str(raised.exception.code))
+        self.assertIn('No space left on device', str(raised.exception.code))
+        self.assertIn('free space on the drive and build again', str(raised.exception.code))
+        self.assertEqual(store.get(f'stage/test/mac/{key}_b.metal'), b'source')
+        store.delete_prefix('stage/test/')
+        self.assertTrue(self.ns['restore_cache'](key, 'd'))
+        self.assertEqual((out / (key + '_b.metallib')).read_bytes(), b'compiled')
 
 
 class TargetSelection(unittest.TestCase):

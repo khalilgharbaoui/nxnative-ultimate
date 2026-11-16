@@ -18,22 +18,30 @@ DM_FPS_TARGET	choice	30=30 fps,60=60 fps,120=120 fps?DM_GAME_FPS_MAX==120&platfo
 DM_DYNAMIC_RESOLUTION	toggle	-	0	fixups:DYNAMIC_RESOLUTION	Game	Dynamic resolution	Lets the game lower its resolution under load. Turn off to keep full resolution for the selected console mode.
 DM_RENDER_SCALE	range	0.5:1.0:0.05	1.0	fixups:RENDER_SCALE	Game	Render scale		level=basic
 DM_OPMODE	choice	1=Docked,0=Handheld	DM_GAME_OPMODE	always	Game	Console mode		level=basic
-DM_PRESENT_UPSCALE	choice	off=Standard,metalfx=MetalFX	off	always	Game	Upscaling	Uses more GPU time and can increase heat.
+DM_PRESENT_UPSCALE	choice	off=Standard,metalfx=MetalFX,fsr=FSR 1	off	always	Game	Upscaling	Uses more GPU time and can increase heat.
 DM_UPSCALER	choice	game=Game's own,metalfx=MetalFX	game	DM_GAME_UPSCALER_N!=0	Game	Game's upscaler
+DM_ANISO	choice	0=Off,2=2x,4=4x,8=8x,16=16x	0	always	Game	Anisotropic filtering	Uses a little more GPU time.
+DM_TRILINEAR	toggle	-	0	gfxapi:nvn	Game	Trilinear filtering
 DM_LANG	choice	languages	build:DM_LANG	languages>1	Game	Game language		level=basic
 DM_FULLSCREEN	choice	0=Window,1=Fullscreen	0	platform:mac	Game	Display mode		level=basic
+DM_FOCUS_PAUSE	toggle	-	0	platform:mac	Game	Pause in the background
 DM_PICTURE_FIT	choice	fit=Fit,fill=Fill	fit	platform:ios	Game	Picture	Fill crops the game's 16:9 picture to cover the screen. Health bars, subtitles or maps near the edges can be cut off. A full-screen picture without cropping needs a patch for each game.
 DM_HDR	toggle	-	0	switch2	Game	HDR output	Takes effect on a screen with HDR headroom; an SDR screen keeps SDR.	level=basic
 DM_HDR_PAPER_WHITE	choice	100=100 nits (standard),120=120 nits,160=160 nits,203=203 nits,250=250 nits,300=300 nits,400=400 nits	100	switch2	Game	HDR paper white		level=basic;needs=DM_HDR=1
 DM_HDR_PEAK	choice	auto=Automatic,400=400 nits,600=600 nits,1000=1000 nits,1600=1600 nits	auto	switch2	Game	HDR peak		level=basic;needs=DM_HDR=1
+DM_VOLUME	choice	0=Muted,0.2=20 %,0.4=40 %,0.6=60 %,0.8=80 %,1.0=100 %	1.0	always	Game	Volume
 DM_SHOW_FPS	toggle	-	build:DM_SHOW_FPS	always	Game	Frame-rate counter
 DM_TOUCH_HAPTICS	toggle	-	1	platform:ios	Controls	Touch feedback
 DM_RUMBLE	toggle	-	1	always	Controls	Game rumble		level=basic
 DM_RUMBLE_GAIN	range	0:3:0.1	1.0	always	Controls	Rumble strength		needs=DM_RUMBLE=1
 DM_RUMBLE_MIN	range	0:0.9:0.05	0	always	Controls	Rumble cutoff
+DM_MOTION	toggle	-	1	always	Controls	Motion controls
 DM_PAD_PRESS_TO_JOIN	toggle	-	0	always	Controls	Press a button to join
 DM_SW2	toggle	-	0	platform:mac	Controls	Switch 2 controllers	Plays Joy-Con 2 and Pro Controller 2 over Bluetooth: hold Sync on one during the game to pair it. macOS asks once for Bluetooth access.
-DM_SCREEN_ASPECT	choice	auto=Match screen?platform:ios,1.43=iPhone Duo screen (1.43:1),0=16:9 (Switch)	auto|0	DM_GAME_SCREEN_ASPECT!=0	Game	Picture shape	Renders about a quarter more pixels: a little slower and warmer.
+DM_SCREEN_ASPECT	choice	auto=Match screen?platform:ios,1.6=MacBook (16:10)?platform:mac,1.43=iPhone Duo screen (1.43:1),0=16:9 (Switch)	auto|0	DM_GAME_SCREEN_ASPECT!=0	Game	Picture shape	Renders about a quarter more pixels: a little slower and warmer.
+DM_AUDIO_LIMIT	toggle	-	DM_GAME_AUDIO_LIMIT	always	Game	Audio limiter	Keeps loud mixes from clipping; loud passages sound slightly different from the console's.
+DM_PRESENT_UPSCALE_OUT	range	1.0:4.0:0.1	1.0	always	Game	Upscaling detail	Uses more GPU time and can increase heat.	needs=DM_PRESENT_UPSCALE=metalfx
+DM_SHARPEN	range	0:1:0.05	0	always	Game	Sharpening
 DM_PRESENT_SNAP	toggle	-	DM_GAME_PRESENT_SNAP	gfxapi:nvn	Performance	Frame buffering	Up to one frame more display latency.
 DM_PSO_MTL4	toggle	-	DM_GAME_PSO_MTL4|1	gfxapi:nvn	Performance	Metal 4 pipelines	Keeps a pipeline archive; uses more memory.
 DM_PSO_PREBUILD	toggle	-	1	gfxapi:nvn	Performance	Pipeline prebuild	The first start waits a few minutes for it, once.	needs=DM_PSO_MTL4=1

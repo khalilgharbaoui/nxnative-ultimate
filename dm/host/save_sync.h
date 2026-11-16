@@ -10,6 +10,7 @@
 // with one, the chosen save wins. Without DM_SAVE_SYNC_CHOICE the newer one wins. Only the start decides: a send replaces a cloud save only when it is no save, the
 // one last synced, damaged, or the one the start chose against. A cloud that changed since (or that the start could not read) waits for the next start.
 // Every save this replaces, here or in the cloud, is kept first in <DM_SAVE>-backups/<date> <side>; the newest 10 of each side stay.
+// With sync on or off, the first save mount also keeps the save the game starts from in <DM_SAVE>-backups/<date> start (a clone), when it changed since the newest of those.
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
@@ -40,9 +41,10 @@ ss_way ss_decide(const char *local, const char *base, const char *remote, int64_
 // ---- what a front end asks the player with (docs/frontends.md, The cloud saves folder) ----
 // Before the start, the two saves as the game's first mount will compare them, in one line of key=value pairs (no newline):
 //   sync=<0 off | 1 on> cloud=<1 read | 0 no save there (or a damaged file, which the mount replaces) | -1 not read within wait_ms>
-//   local=<hash|-> saved=<secs> files=<n> size=<bytes> chash=<hash|-> csaved=<secs> cfiles=<n> csize=<bytes> cdevice=<model, e.g. iPhone17,1|-> sametitle=<0|1> conflict=<0|1>
+//   local=<hash|-> saved=<secs> files=<n> size=<bytes> chash=<hash|-> csaved=<secs> cfiles=<n> csize=<bytes> cdevice=<model, e.g. iPhone17,1|-> sametitle=<0|1> conflict=<0|1> pull=<0|1>
+// pull = a pull of the cloud's save did not finish (<save>.pull): what is in place may be half the cloud's, so conflict is 0; the start's mount puts this device's save back first
 // conflict = both changed since the last sync (or this device has never synced and both have a save): the case the front end shows both saves for and answers with
-// DM_SAVE_SYNC_CHOICE=local:<local> or cloud:<chash>; with no conflict it passes `ask`, and with cloud=-1 `offline` (the mount does not wait again).
+// DM_SAVE_SYNC_CHOICE=local:<chash> (local:none with no cloud save) or cloud:<chash>, both naming the cloud's save the player chose against; with no conflict it passes `ask`, and with cloud=-1 `offline` (the mount does not wait again).
 // `save` is the committed save folder (DM_SAVE), `title` the title ID, `folder` the cloud folder as DM_SAVE_SYNC would name it (NULL: DM_SAVE_SYNC itself), and
 // `wait_ms` how long the cloud's file may take to come (<= 0: as long as the mount waits). Blocks that long at most: call it off the main thread.
 // 0 on success, -1 when the arguments do not fit or this device's save cannot be read
@@ -50,7 +52,11 @@ int save_sync_report(const char *save, const char *title, const char *folder, in
 
 // ---- the host ----
 const char *dm_save_title(void);          // the title ID the cloud file is named after (hle_fs.c, from the game's profile): for a front end in the host's process (the iPhone launcher)
-void save_sync_mount(const char *save, const char *title);   // the game's first save mount (hle_fs.c): brings the cloud's save in when it is the one to keep, starts the sender
+// The game's first save mount (hle_fs.c): puts back this device's save from a pull of the cloud's that did not finish (<save>.pull, whatever DM_SAVE_SYNC says), then
+// brings the cloud's save in when it is the one to keep, starts the sender, and keeps the start copy. 0: the save may be mounted (whether or not the cloud's came in);
+// -1: it may not, as this device's save could not be put back whole (the log says where it is; the next start tries again; no start copy). A second mount gets the
+// first's answer
+int save_sync_mount(const char *save, const char *title);
 void save_sync_committed(void);           // a Commit went through (hle_fs.c, under its locks: it only wakes the sender)
 int save_sync_flush(int timeout_ms);      // sends now what was committed and not sent (the iPhone app going to the background): 1 = in step with the cloud, 0 = not (yet)
 int save_sync_after_exit(const char *save, const char *title);   // the Mac launcher once the host has exited (a crash included): 1 = in step, 0 = not

@@ -283,6 +283,19 @@ class Nvn(Base):
         with mock.patch.object(nsp, 'say', said.append): self.build(False)
         self.assertEqual(self.ran, []); self.assertNotIn(OLD, self.entries()); self.assertIn(NEW, self.entries())
 
+    def test_slim_cache(self):   # SLIM_CACHE: the listed entries and the index go too, once the build succeeded; the image and metallib/ stay, and the image reads the same
+        def build(slim): self.ran.clear(); return nsp.build_shaders(sys.executable, REPO, self.sh, REPO / 'dm/gfx/tools/dmsh_xlate_bin/dmsh_xlate', {'WORK': str(self.tmp), 'IOSOUT': '/elsewhere'}, self.logs, self.g, pkg_key='P', mac=False, slim=slim)
+        self.cas(LIVE, OLD); s = self.store(); s.put('index/k.json', b'{}', 0); s.put('metallib/mac/m.metallib', b'l' * 1000, 0)
+        build(False)
+        self.assertEqual(self.entries(), {LIVE}); self.assertEqual(self.store().names('index/'), {'index/k.json'})   # not slim: only the unlisted entry goes
+        img = self.sh / 'cache' / f'b-{CHAIN}.img'; before = img.read_bytes()
+        said = []
+        with mock.patch.object(nsp, 'say', said.append): build(True)
+        self.assertEqual(self.ran, []); self.assertEqual(self.entries(), set()); self.assertEqual(self.store().names('index/'), set())
+        self.assertEqual(self.store().get('metallib/mac/m.metallib'), b'l' * 1000); self.assertEqual(img.read_bytes(), before)
+        self.assertEqual([m for m in said if 'shader cache entries' in m], ['removed all shader cache entries: 1 (0.1 KB)'])
+        self.assertEqual(build(True), self.sh / 'ios'); self.assertEqual(self.ran, [])   # reused still: a build reads neither
+
     def test_prune_shader_cache_needs_success_and_the_list(self):   # a failed build, or libraries from before the list, keep every entry
         self.build(False); self.cas(OLD)
         (self.sh / 'ios' / f'b-{CHAIN}.key').unlink()   # not reused: the step runs, and fails
@@ -304,6 +317,10 @@ class Nvn(Base):
         self.build(True)
         (self.tmp / 'cb_extent.tsv').write_text(f'# chain b-{CHAIN} inputs bbbbbbbbbbbb 2026-10-23T00:00:00+00:00\n')
         self.assertEqual(self.build(True), self.sh / 'cache'); self.assertEqual([Path(c[1]).name for c, _ in self.ran], ['cb_extent.py'])
+
+    def test_the_build_hands_the_table_memo(self):   # c1_guard.py / cb_extent.py keep their answers in the shader cache (DMSH_TABLE_MEMO)
+        self.build(True)
+        self.assertEqual(self.ran[0][1]['DMSH_TABLE_MEMO'], str(self.sh / 'cache'))
 
     def test_split_pairs_invalidate_shader_reuse(self):
         # A registered profile may have no pso_pairs.tsv: the split's copy feeds vs_pad.
@@ -328,6 +345,40 @@ class Nvn(Base):
         self.assertEqual(watch(), {'step': 'compiling', 'done': 7, 'total': 10, 'unit': 'shaders', 'note': '4 not cached'})
         p.write_text('{"step": "comp')   # half written: no progress this time, not an error
         self.assertIsNone(watch())
+
+    def test_shader_watch_follows_the_steps_after_the_last_shader(self):   # the count's last write is up to half a second old: the line stood at 42,811 of 42,848 for two minutes
+        p, mac, ios = self.tmp / 'progress.json', self.tmp / 'cache/b-x.img', self.tmp / 'ios/b-x.img'
+        mac.parent.mkdir(); ios.parent.mkdir()
+        watch = nsp.ShaderWatch(p, [mac, ios], tables=True)
+        self.assertIsNone(watch())   # before dmsh_build.py writes the file, its absence is not the tables
+        p.write_text('{"step": "compiling", "done": 42811, "total": 42848, "cached": 42848, "misses": 0}')
+        self.assertEqual(watch()['step'], 'compiling')
+        Path(str(mac) + '.part').write_bytes(b'x' * 300)   # publish_library: the Mac image, then the iPhone's
+        self.assertEqual(watch(), {'step': 'writing the library image', 'done': 300, 'unit': 'B'})
+        Path(str(mac) + '.part').rename(mac)
+        self.assertEqual(watch()['step'], 'writing the library image')   # between the two images: not back to the stale count
+        Path(str(ios) + '.part').write_bytes(b'y' * 50)
+        self.assertEqual(watch(), {'step': 'writing the library image', 'done': 350, 'unit': 'B'})
+        Path(str(ios) + '.part').rename(ios); p.unlink()   # dmsh_build.py removes the file, then runs c1_guard.py
+        self.assertEqual(watch(), {'step': 'c1 bounds (c1_guard.py)'})
+        watch.line('c1_full.tsv: not proven bounded: 650 shaders')
+        self.assertEqual(watch(), {'step': 'uniform read extents (cb_extent.py)'})
+        watch.line('cb_extent.tsv: bounded uniform reads: 113457 slots; storage slots never written: 43088; 39125 shaders')
+        self.assertIsNone(watch())
+
+    def test_shader_watch_partial_build_has_no_tables(self):   # --seen-shaders: dmsh_build.py makes no tables, and exits once the file is gone
+        p = self.tmp / 'progress.json'; watch = nsp.ShaderWatch(p, [self.tmp / 'b-x.img'], tables=False)
+        p.write_text('{"step": "compiling", "done": 1, "total": 2}'); watch(); p.unlink()
+        self.assertIsNone(watch())
+
+    def test_the_build_follows_dmsh_builds_lines(self):   # ShaderWatch.line gets own_compilers.py's output, and watches the Mac library's image
+        lines = []
+        def recording(cmd, log, env=None, cwd=None, on_line=None):
+            if Path(cmd[1]).name == 'own_compilers.py': lines.append(on_line)
+            return self.fake_run(cmd, log, env=env, cwd=cwd, on_line=on_line)
+        with mock.patch.object(nsp, 'run', recording): self.build(True)
+        self.assertEqual(lines[0].__self__.images, [Path(nsp.shader_lib.image_of(self.sh / 'cache' / f'b-{CHAIN}'))])
+        self.assertTrue(lines[0].__self__.tables)
 
 
 class EnvFile(Base):

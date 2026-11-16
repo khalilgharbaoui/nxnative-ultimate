@@ -3,10 +3,10 @@
 The screen before the game starts shows the settings the game supports. A setting that only matters while another is on appears under it and disappears when that one is turned off. Tap **Play** to start; the app remembers your choices for the next start. All settings are on one scrollable screen, under **Game**, **Controls** and **Performance**. Tap a menu or move a slider there; no settings page needs opening. **Upscaling** is in **Game**, beside **Console mode**. A Mac app shows the same settings in a [window of its own](#the-mac-settings-window).
 
 - [Tested defaults](#tested-defaults)
-- [Game](#game): [Frame rate](#frame-rate), [Render scale](#render-scale), [Console mode](#console-mode), [Upscaling](#upscaling), [Game's upscaler](#games-upscaler), [Game language](#game-language), [Picture](#picture), [HDR output](#hdr-output), [HDR paper white](#hdr-paper-white), [HDR peak](#hdr-peak), [Frame-rate counter](#frame-rate-counter)
-- [Controls](#controls): [Touch feedback](#touch-feedback), [Game rumble](#game-rumble), [Rumble strength](#rumble-strength), [Rumble cutoff](#rumble-cutoff), [Press a button to join](#press-a-button-to-join)
+- [Game](#game): [Frame rate](#frame-rate), [Render scale](#render-scale), [Console mode](#console-mode), [Upscaling](#upscaling), [Upscaling detail](#upscaling-detail), [Sharpening](#sharpening), [Game's upscaler](#games-upscaler), [Anisotropic filtering](#anisotropic-filtering), [Trilinear filtering](#trilinear-filtering), [Game language](#game-language), [Picture](#picture), [Audio limiter](#audio-limiter), [Volume](#volume), [HDR output](#hdr-output), [HDR paper white](#hdr-paper-white), [HDR peak](#hdr-peak), [Frame-rate counter](#frame-rate-counter)
+- [Controls](#controls): [Touch feedback](#touch-feedback), [Game rumble](#game-rumble), [Rumble strength](#rumble-strength), [Rumble cutoff](#rumble-cutoff), [Motion controls](#motion-controls), [Press a button to join](#press-a-button-to-join)
 - [Performance](#performance): [Frame buffering](#frame-buffering), [Metal 4 pipelines](#metal-4-pipelines), [Pipeline prebuild](#pipeline-prebuild), [Encode thread](#encode-thread), [Hold frames when late](#hold-frames-when-late), [Performance HUD](#performance-hud), [Reset to tested defaults](#reset-to-tested-defaults)
-- [The Mac settings window](#the-mac-settings-window): [Display mode](#display-mode)
+- [The Mac settings window](#the-mac-settings-window): [Display mode](#display-mode), [Pause in the background](#pause-in-the-background)
 - [In-game menu](#in-game-menu)
 - [TV](#tv)
 - [Settings in a file](#settings-in-a-file)
@@ -43,7 +43,7 @@ Hades II goes up to 300 %: it renders its whole picture, the HUD and text includ
 
 ### Upscaling
 
-A game that renders below the screen's resolution is scaled up to the screen. **Standard**, the default, scales smoothly; **MetalFX** uses Apple's MetalFX upscaler, which sharpens edges and text as it scales.
+A game that renders below the screen's resolution is scaled up to the screen. **Standard**, the default, scales smoothly; **MetalFX** uses Apple's MetalFX upscaler, which sharpens edges and text as it scales. **FSR 1** uses AMD's FSR 1 edge adaptive upsampling in the present pass: a similar look for less GPU time (iPad Pro 13" M4, 1920x1440 to 2752x2064: 1.6 ms a frame against MetalFX's 2.2 and Standard's 0.4).
 
 ```mermaid
 flowchart LR
@@ -59,6 +59,24 @@ Breath of the Wild renders 1280x720 in handheld mode. Docked it renders its worl
 - **When to change it:** turn it on if the picture looks soft and the device has GPU time to spare: on a Mac, or on an iPhone in handheld mode at 30 fps. For long sessions at 60 fps on an iPhone leave it at Standard.
 - **Cost:** more GPU time each frame, which can increase heat on an iPhone. [Breath of the Wild's measurements](../dm/games/01007EF00011E000/README.md#upscaling-current) cover Mac and iPhone; the matching iPhone Standard run and MetalFX's share of the thermal cost remain unmeasured. Nothing changes while the game's picture is as large as the screen. Unsupported devices and sizes use Standard scaling.
 - **On the Mac:** choose **MetalFX** under **Upscaling** in the [settings window](#the-mac-settings-window)'s Advanced settings, or set `DM_PRESENT_UPSCALE=metalfx` in its `env.txt` (off by default). It helps in a large window or on a 4K screen.
+
+### Upscaling detail
+
+Only does something with **Upscaling** set to **MetalFX**. MetalFX normally reconstructs the picture at the screen's size. This reconstructs it larger and averages it back down, which is supersampling: thinner edges, less shimmer on fences, grass and distant detail.
+
+**100%**, the default, reconstructs at the screen's size as before. **200%** reconstructs at twice it in each direction and averages four samples per pixel, **400%** sixteen.
+
+- **When to change it:** on a device with GPU time to spare. It is the sharpest the picture gets without the game rendering more.
+- **Cost:** more GPU time each frame, which can increase heat. Nothing above the reconstruction's own size is allocated beyond one larger texture.
+
+### Sharpening
+
+Lifts edges in the finished picture without touching flat areas, and is clamped to the brightness range of the pixels around each one, so it cannot ring or draw halos.
+
+**0%**, the default, is off. It replaces the normal present rather than adding a pass, so it costs no extra draw.
+
+- **When to change it:** a soft picture, especially where the game renders below the screen's size and no upscaler is on.
+- **Cost:** four more texture reads in the final draw.
 
 ### Game's upscaler
 
@@ -76,6 +94,27 @@ flowchart LR
 - **When to change it:** when the game falls short of its frame rate in busy scenes because of GPU time: Donkey Kong Bananza's upscaler is the largest single piece of a heavy frame on an M1 (3.5-5 ms of about 24 in handheld mode). Compare the look side by side before keeping it.
 - **Cost:** none in GPU time (it saves 2.5-4 ms a frame in that case); the picture is Apple's scaler's rather than the game's. Frames where the game renders at its output size are not upscaled and keep the game's shader either way. Devices without MetalFX keep the game's upscaler.
 - **Not the same as [Upscaling](#upscaling):** that one scales the finished picture, HUD included, to the screen; this one replaces the game's own step inside the frame. Both can be on.
+
+### Anisotropic filtering
+
+How sharp a texture stays when you look along it rather than at it: the ground ahead of you, a wall seen edge on, a road running to the horizon. The games were built for a handheld and nearly all ask for none, so those surfaces blur a short way from the camera.
+
+**Off**, the default, keeps what the game asked for. **2x** to **16x** raise a texture to at least that, leaving a game that already asks for more alone. It works in all three graphics layers (NVN, Vulkan and OpenGL).
+
+- **When to change it:** any game with ground or walls stretching away from the camera. It works in games that have no render scale.
+- **Which textures:** a 2D texture, or a 2D array, with more than one mip level, read through a linear sampler with mips and the regular level range, or one the game already gave anisotropy. A one-level texture, or a sampler clamped to the first level, keeps the game's value: raised, a one-level texture turned every silhouette in Breath of the Wild jagged, because its anti-aliasing pass reads one that way. Shadow maps and the depth pyramids a game uses to decide what is visible keep what the game asked for too, because filtering those along an angle changes what they mean rather than how they look (a raised shadow sampler drew a line along a shadow cascade join on open ground, reported in PR #335). **Trilinear filtering** below turns mip blending on for a texture whose mips the game picked nearest.
+- **Note:** the choice is made for each texture bound with its sampler. A game that binds its textures apart from their samplers sees no change from this setting.
+- **Cost:** little on a Mac (M5 Max, GPU p50 off → on: Breath of the Wild 6.60 → 6.59 ms, Ocarina of Time 13.67 → 13.77 ms); an iPhone is not measured. Nothing is allocated and no render target changes, so memory is unaffected.
+- **On the Mac:** choose it under **Anisotropic filtering** in the [settings window](#the-mac-settings-window)'s Advanced settings, or set `DM_ANISO=16` in its `env.txt` (off by default).
+
+### Trilinear filtering
+
+Blends between a texture's mipmap levels instead of switching at the level boundary, which removes the seam that runs across ground and walls at a fixed distance from the camera.
+
+Only a texture the game already filters smoothly is raised, so menus, fonts and lookup tables keep the sharp mip steps they were drawn with.
+
+- **When to change it:** a visible line across the floor that moves with the camera.
+- **Cost:** one more texture read where it applies.
 
 ### Game language
 
@@ -101,6 +140,17 @@ Shown under **HDR output** while it is on. The brightest level the game is told 
 
 Games whose profile supports it (Breath of the Wild, Animal Crossing: New Horizons). **iPhone Duo screen (1.43:1)** renders a taller picture of the Duo's own shape: the sides of 16:9 with more above and below, and the HUD at the screen's edges. **16:9** is the Switch's picture. The taller picture has about a quarter more pixels, so it runs a little slower and warmer.
 
+### Volume
+
+The loudness of the game's sound, **Muted** or 20 to 100 % in steps of 20, on top of the game's own volume and the device's. A change while the game plays fades in over one audio block, without a click. The steps follow a loudness curve: 60 % is about a third of the amplitude (-9 dB), 20 % about a twenty-fifth (-28 dB). On the iPhone and iPad the [in-game menu](#in-game-menu) changes it while the game runs.
+
+### Audio limiter
+
+A game that mixes its voices with no headroom can pass the loudest level a sound output holds. The Switch and this app cut such peaks flat, which is heard as crackle in loud scenes. With the limiter on, the app looks about 1 ms ahead in the sound it is about to play (no delay is added) and turns the whole mix down before a peak reaches that level, instead of cutting it flat; the volume comes back with a time constant of 50 ms (both channels together, so the stereo picture stays). A mix that stays below the level is not changed at all.
+
+- **When to change it:** turn it on if a game crackles in loud scenes. It is off by default, because the console does not have it.
+- **Cost:** none in speed; loud passages are a little quieter than on the Switch for a moment after each peak.
+
 ### Frame-rate counter
 
 Shows the frames per second at the top left. On the Mac it also shows the longest frame of the last second (a freeze shows there) and the GPU time per frame; **Window > Frame-Rate Counter** turns it on and off while the game runs.
@@ -122,6 +172,10 @@ How strong the game's vibration is, from 0 to 300 %.
 ### Rumble cutoff
 
 A controller's vibration weaker than this stays off, and the rest is spread over the full range. Off (0 %) by default. A controller with rotating motors can rumble all the time in a game that sends a quiet texture: Mario Kart 8 Deluxe needs about 45 % to rumble only on crashes and drifts. The phone's own vibration is not affected.
+
+### Motion controls
+
+On by default: a controller's gyro and accelerometer (and on the iPhone, the phone's own when no controller supplies them) reach games that read motion ([Motion (gyro)](playing.md#motion-gyro)). Off: the game sees a controller lying flat and still, and the controllers' motion sensors and the phone's are not switched on; a shake still reaches the game. Turn it off when motion moves the camera or the aim in a way you do not want and the game has no option of its own for it. An app packed with `--no-motion` has it fixed off; `DM_MOTION=1` in `env.txt` turns it back on.
 
 ### Press a button to join
 
@@ -235,7 +289,7 @@ Sets every setting back to the game's tested default; **Play** then forgets your
 
 A Mac app ([A Mac app](development.md#a-mac-app)) shows its settings in a window before the game starts. They are the same settings as on the iPhone, with the same defaults. The window shows the most used ones first: **Frame rate**, **Render scale**, **Console mode**, **Game language**, **Display mode** and **Game rumble**, when the game has them. **Render scale** shows the picture's size in pixels beside the percentage for the chosen **Console mode**, when the game's profile has it (Breath of the Wild: 1600 × 900 docked, 1280 × 720 handheld at 100 %). The others are under **Advanced settings**, in the usual sections, with **Reset to tested defaults**. The window remembers whether Advanced settings is open. **Touch feedback** and **Picture** are only on the iPhone.
 
-Click **Play** (or press Return) to start the game. **Quit**, ⌘Q or closing the window ends the app without the game. The app remembers your choices for that game, and a game started without the window, from a front end or with the window turned off, uses them too ([Saved choices](frontends.md#saved-choices)). A setting fixed by an `env.txt` or by the program that started the app is shown greyed out.
+Click **Play** (or press Return) to start the game. **Quit**, ⌘Q or closing the window ends the app without the game. With a controller, A is **Play** and B is **Quit**, the buttons marked A and B (cross and circle on a PlayStation controller), as in the quit and player prompts over the game, and each takes effect when the button is let go, so the press does not reach the game. A button held when the window comes up counts only from its next press, and A and B do nothing while a question about the cloud save is open: choose there with the mouse or the keyboard. The settings rows are not moved through with a controller, and a controller the game reads outside Apple's controller support (a raw HID pad, Switch 2 controllers) does not start it from the window. The app remembers your choices for that game, and a game started without the window, from a front end or with the window turned off, uses them too ([Saved choices](frontends.md#saved-choices)). A setting fixed by an `env.txt` or by the program that started the app is shown greyed out.
 
 Turn off **Show this window at launch** to start the game at once with your choices. Hold Option while the app opens to see the window again. `DM_LAUNCHER=0` in the app's `env.txt` (`~/Library/Application Support/nxnative/<title ID>/env.txt`) or in its environment, or opening it with `open <app> --args --no-launcher`, also skips the window; your choices still apply. `DM_SAVED_CHOICES=0` starts with the tested defaults instead.
 
@@ -247,6 +301,12 @@ Turn off **Show this window at launch** to start the game at once with your choi
 
 **Off** by default. On, the game takes Joy-Con 2 and Pro Controller 2 over Bluetooth: hold the small Sync button on one during the game, until its player lights sweep, to pair it with this Mac; after that a press of any of its buttons connects it ([Switch 2 controllers](playing.md#switch-2-controllers-mac)). macOS asks for Bluetooth access the first time, and again after the app is packed again. In an `env.txt`: `DM_SW2=1`.
 
+**Controller menu and panel** (in the game window, with Switch 2 controllers on): the **Controller** menu lists the connected Switch 2 controllers, and **Show Controller Window** (⌘⇧P, or `DM_CONTROLLER_WINDOW=1` in an `env.txt` to open it at launch) opens a panel that shows a controller's stick live and marks where it comes to rest each time it is let go, red where the game would see it move past the stick's dead zone (the stick's own, read from the controller). It can also calibrate the stick's centre and reach and save them in the controller, with a backup first; the game uses the new calibration at once. On a Pro Controller 2 either stick can be calibrated. While the panel is open the game gets no input from Switch 2 controllers: close it to play. `DM_SW2_CALIBRATE=1` left on re-centres the stick at every start and so overrides a calibration saved from the panel: turn it off once the panel is used ([Switch 2 controllers over Bluetooth LE](reference/services.md#switch-2-controllers-over-bluetooth-le)).
+
+### Pause in the background
+
+On, the game pauses when you click another app or window, and goes on when you click its window again: sound stops and the game's clock stands still, as when the iPhone app goes to the background. Off (the default), the game keeps running while another window has the focus, and some games stop updating the picture then, as a Switch game does behind the Home menu. Minimizing the window pauses it either way. In an `env.txt`: `DM_FOCUS_PAUSE=1` or `0`.
+
 ### Cloud saves folder
 
 **Choose a folder…** picks the iCloud Drive folder the game's save is synced through, the one the iPhone app chose in its launcher's **Cloud saves**, or the game's own folder inside it, named after its title ID ([Cloud saves](#cloud-saves)); **Turn off** stops it. Off by default. macOS may ask once whether the app may open iCloud Drive; if the game log says `this app may not open iCloud Drive`, allow it in System Settings › Privacy & Security › Files and Folders. In an `env.txt`: `DM_SAVE_SYNC=<folder>`, or `DM_SAVE_SYNC=icloud` for iCloud Drive › nxnative Saves; the window then shows it fixed.
@@ -257,13 +317,17 @@ The Mac app and the iPhone app of one game can share a save through iCloud Drive
 
 When the game starts, it brings the save from iCloud Drive in if only that one changed since the last sync; a few seconds after the game saves, it sends its save if only this one changed. The iPhone app also sends when it goes to the background, and the Mac app once the game has quit. If you played on both without the save getting across in between, **Play** asks which save to keep: each with its date and size, since the newer one is not always the one with more progress (a new game saved a minute later is newer). The one you don't pick is kept, as below. Without the settings screen (the Mac's `DM_LAUNCHER=0`), the newer save wins.
 
-A save that is replaced, on the device or in iCloud Drive, is kept first, beside the save in a folder named after it with `-backups` (on the iPhone `save-backups` in the Files app, under the app's name; on the Mac `~/Library/Application Support/nxnative/<title ID>/save-backups`): `<date> local` holds this device's save, `<date> cloud` the one that was in iCloud Drive. The newest 10 of each kind stay, and older ones are removed; other folders you put there are left alone.
+A save that is replaced, on the device or in iCloud Drive, is kept first, beside the save in a folder named after it with `-backups` (on the iPhone `save-backups` in the Files app, under the app's name; on the Mac `~/Library/Application Support/nxnative/<title ID>/save-backups`): `<date> local` holds this device's save, `<date> cloud` the one that was in iCloud Drive. The newest 10 of each kind stay, and older ones are removed; other folders you put there are left alone. The same folder also holds the copies taken at each start ([Save backups](#save-backups)).
 
 iCloud Drive takes a moment to carry a file from one device to the other. Quit the game on one device and give it a few seconds before you start it on the other. **Play** waits for the save in iCloud Drive to download, with **Play Without It** to go on at once; without a connection, or when it has not come in a minute, it says so and offers this device's save or another try. The game then plays on with the save it has and sends it later. If the save in iCloud Drive changed meanwhile, the game sends nothing that session, and the next start decides between the two as above. The game log says what came in and what went out (lines starting with `save sync:`).
 
+## Save backups
+
+Each time the game starts, with or without cloud saves, the save it starts from is copied to `<date> start` in the same `-backups` folder as above (on the iPhone `save-backups` in the Files app, under the app's name; on the Mac `~/Library/Application Support/nxnative/<title ID>/save-backups`), before the game can write to it. A crash while saving, a save the game breaks, or a mod then costs at most the session since that start: quit the game and copy the `save` folder (and `save_device`, when there is one) from the backup over the save. A copy is made only when the save changed since the newest one, so starting again without playing adds none, and a first start with no save makes none. The newest 10 stay, apart from the 10 of each kind cloud saves keep, so start copies never push those out. On the APFS volumes the Mac and the iPhone keep saves on, a copy is a clone: it takes no space at first and grows only as the game changes the save after it. If the copy cannot be made, the log says so (a line starting with `[RED] save backup:`) and the game starts as usual.
+
 ## In-game menu
 
-On the iPhone and iPad the gear at the top centre of the touch controls opens a menu while the game runs; it stays when a controller hides the other controls. It holds **Console mode**, **Picture**, **HDR output** (Switch 2 games) and the **Frame-rate counter**, then **Controller layout** (**2D**, **3D**, and **Tap**, no controls and every touch to the game, in handheld mode), **Touch feedback** and **Game rumble**: the settings that take effect at once. A choice opens to show its options, the current one ticked. The menu's text keeps one size whatever the system text size, so it stays short over the game. A change is remembered as on the settings screen, which shows it at the next start; a setting `Documents/env.txt` fixes is shown, not changed. The other settings need the game to start again, so they are only on the settings screen: close the app fully and open it again.
+On the iPhone and iPad the gear at the top centre of the touch controls opens a menu while the game runs; it stays when a controller hides the other controls. It holds **Console mode**, **Picture**, **Volume**, **HDR output** (Switch 2 games) and the **Frame-rate counter**, then **Controller layout** (**2D**, **3D**, and **Tap**, no controls and every touch to the game, in handheld mode), **Touch feedback** and **Game rumble**: the settings that take effect at once. A choice opens to show its options, the current one ticked. The menu's text keeps one size whatever the system text size, so it stays short over the game. A change is remembered as on the settings screen, which shows it at the next start; a setting `Documents/env.txt` fixes is shown, not changed. The other settings need the game to start again, so they are only on the settings screen: close the app fully and open it again.
 
 Console mode changes as on a Switch put in or taken out of its dock. While a TV shows the game it stays **Docked**, and the mode you pick applies when the TV is disconnected. **Docked** removes the Tap layout, as a docked Switch reads no touch screen.
 
@@ -282,17 +346,25 @@ A line like `DM_PRESENT_SNAP=0` in `Documents/env.txt` (in the Files app, under 
 | Console mode | `DM_OPMODE` | `1` docked, `0` handheld |
 | Game language | `DM_LANG` | a language code, such as `ja` |
 | Display mode (Mac) | `DM_FULLSCREEN` | `1` fullscreen, `0` a window |
+| Pause in the background (Mac) | `DM_FOCUS_PAUSE` | `1`, `0` |
 | Cloud saves folder (Mac) | `DM_SAVE_SYNC` | a folder; `icloud`: iCloud Drive › nxnative Saves; `0`: off |
 | Picture (iPhone and iPad) | `DM_PICTURE_FIT` | `fit` 16:9 with black bars, `fill` covers the screen, cropped |
-| Picture shape | `DM_SCREEN_ASPECT` | `auto` the app window's own shape where it is taller than 16:9 (iPad 4:3, iPhone Duo 1.43:1), else 16:9 (iOS only); `1.43` the iPhone Duo's shape, `0` 16:9 |
+| Picture shape | `DM_SCREEN_ASPECT` | `auto` the app window's own shape where it is taller than 16:9 (iPad 4:3, iPhone Duo 1.43:1), else 16:9 (iOS only); `1.6` MacBook (16:10, Mac only); `1.43` the iPhone Duo's shape, `0` 16:9 |
+| Volume | `DM_VOLUME` | `0`, `0.2`, `0.4`, `0.6`, `0.8`, `1.0` (any value from `0` to `1` works from the file) |
+| Audio limiter | `DM_AUDIO_LIMIT` | `1`, `0` |
 | Frame-rate counter | `DM_SHOW_FPS` | `1`, `0` |
 | Touch feedback | `DM_TOUCH_HAPTICS` | `1`, `0` |
 | Game rumble | `DM_RUMBLE` | `1`, `0` |
 | Rumble strength | `DM_RUMBLE_GAIN` | `0` to `3` |
 | Rumble cutoff | `DM_RUMBLE_MIN` | `0` to `0.9` |
+| Motion controls | `DM_MOTION` | `1`, `0` |
 | Press a button to join | `DM_PAD_PRESS_TO_JOIN` | `1`, `0` |
-| Upscaling | `DM_PRESENT_UPSCALE` | `off`, `metalfx` |
+| Upscaling | `DM_PRESENT_UPSCALE` | `off`, `metalfx`, `fsr` |
+| Upscaling detail | `DM_PRESENT_UPSCALE_OUT` | `1.0` to `4.0` |
+| Sharpening | `DM_SHARPEN` | `0` to `1` |
 | Game's upscaler | `DM_UPSCALER` | `game`, `metalfx` |
+| Anisotropic filtering | `DM_ANISO` | `0` off, `2` to `16` |
+| Trilinear filtering | `DM_TRILINEAR` | `1`, `0` |
 | Frame buffering | `DM_PRESENT_SNAP` | `1`, `0` |
 | Metal 4 pipelines | `DM_PSO_MTL4` | `1`, `0` |
 | Pipeline prebuild | `DM_PSO_PREBUILD` | `1`, `0` |

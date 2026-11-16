@@ -21,23 +21,29 @@ static void queue_encoded(void) {
     CHECK("queued present reaches physical encoding", result == NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED || result == NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED);
     h_nvnSyncFinalize(&sync);
 }
-static tex_t source_n(unsigned i, int n) {   // n x n texels of 73 + i (n at most 16)
+static tex_t source_tex(uint64_t serial, int n, int v) {   // an n x n RGBA8 texture of texels v, registered under serial
     MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:n height:n mipmapped:NO];
     d.storageMode = MTLStorageModeShared; d.usage = MTLTextureUsageShaderRead;
-    id<MTLTexture> mt = [g_dev newTextureWithDescriptor:d]; uint8_t bytes[1024]; memset(bytes, 73 + i, sizeof bytes);
-    [mt replaceRegion:MTLRegionMake2D(0, 0, n, n) mipmapLevel:0 withBytes:bytes bytesPerRow:n * 4];
-    tex_t t = {.magic=MAGIC('T','E','X',0), .serial=90001+i};
+    id<MTLTexture> mt = [g_dev newTextureWithDescriptor:d]; uint8_t *bytes = malloc((size_t)n * n * 4); memset(bytes, v, (size_t)n * n * 4);
+    [mt replaceRegion:MTLRegionMake2D(0, 0, n, n) mipmapLevel:0 withBytes:bytes bytesPerRow:n * 4]; free(bytes);
+    tex_t t = {.magic=MAGIC('T','E','X',0), .serial=serial};
     t.d.width = t.d.height = n; t.d.depth = t.d.levels = t.d.samples = 1;
     t.d.target = NVN_TEXTURE_TARGET_2D; t.d.format = NVN_FORMAT_RGBA8;
     serial_put(t.serial, mt); res_add(mt); res_commit(); return t;
 }
+static tex_t source_n(unsigned i, int n) { return source_tex(90001 + i, n, 73 + i); }   // n x n texels of 73 + i
 static tex_t source(unsigned i) { return source_n(i, 8); }
-static void pixels(id<MTLTexture> t, int value) {
-    id<MTLBuffer> out = [g_dev newBufferWithLength:256 options:MTLResourceStorageModeShared];
+static id need(id o, const char *what) { if (!o) { fprintf(stderr, "t_present_snap: Metal returned no %s\n", what); exit(1); } return o; }   // a Metal object the test cannot go on without
+static id<MTLSharedEvent> new_gate(void) { return need([g_dev newSharedEvent], "shared event"); }
+static id<MTLBuffer> read_block(id<MTLTexture> t, NSUInteger x0, NSUInteger y0) {   // the 8 x 8 texels of t at (x0, y0), 4 bytes each
+    id<MTLBuffer> out = need([g_dev newBufferWithLength:256 options:MTLResourceStorageModeShared], "buffer");
     id<MTLCommandBuffer> cb = [g_q commandBuffer]; id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
-    [b copyFromTexture:t sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(8,8,1)
+    [b copyFromTexture:t sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(x0, y0, 0) sourceSize:MTLSizeMake(8, 8, 1)
         toBuffer:out destinationOffset:0 destinationBytesPerRow:32 destinationBytesPerImage:256];
-    [b endEncoding]; [cb commit]; [cb waitUntilCompleted];
+    [b endEncoding]; [cb commit]; [cb waitUntilCompleted]; return out;
+}
+static void pixels(id<MTLTexture> t, int value) {
+    id<MTLBuffer> out = read_block(t, 0, 0);
     int bad = 0; for (int i = 0; i < 256; i++) bad += ((uint8_t *)out.contents)[i] != value;
     CHECK("snapshot has the expected pixels", bad == 0);
 }
@@ -56,7 +62,7 @@ static void suspend_case(void) {
     tex_t t = source(0);
     state_reset(); memset(&R, 0, sizeof R); mtl_sub_begin();
     CHECK("prior submission completed", mtl_wait(mtl_sub_commit(), 2000000000ull));
-    id<MTLSharedEvent> gpu_gate = [g_dev newSharedEvent];
+    id<MTLSharedEvent> gpu_gate = new_gate();
     [g_q4 waitForEvent:gpu_gate value:1];
     gate_encoder();
     // The OS has stopped the display link before notifying the app to suspend.
@@ -109,7 +115,7 @@ static void pacing_case(void) {
 }
 static void pending_copy_case(void) {
     tex_t t = source(0);
-    id<MTLSharedEvent> gpu_gate = [g_dev newSharedEvent]; if (!gpu_gate) abort(); [g_q4 waitForEvent:gpu_gate value:1];
+    id<MTLSharedEvent> gpu_gate = new_gate(); [g_q4 waitForEvent:gpu_gate value:1];
     pthread_mutex_lock(&g_pq_mu); g_link_owns_layer = 1; pthread_mutex_unlock(&g_pq_mu);
     uint64_t v0 = g_snap_v;   // a snapshot keeps its present ticket (LNPANDY/NX2Apple#1117): the copy count tells a snapshot from a fallback
     CHECK("first snapshot queued", present_enqueue(&t, 1. / 60, NULL, 0, NULL) != 0 && g_snap_v == v0 + 1);
@@ -130,7 +136,7 @@ static void resize_case(void) {
     snap_present(&small); snap_present(&small);
     CHECK("both ring slots copied", [g_snap_ev waitUntilSignaledValue:g_snap_v timeoutMS:2000]);
     id<MTLTexture> old0 = g_snap[0].tex, old1 = g_snap[1].tex;
-    id<MTLSharedEvent> gpu_gate = [g_dev newSharedEvent]; if (!gpu_gate) abort(); [g_q4 waitForEvent:gpu_gate value:1];   // stands for display command buffers still queued
+    id<MTLSharedEvent> gpu_gate = new_gate(); [g_q4 waitForEvent:gpu_gate value:1];   // stands for display command buffers still queued
     snap_present(&big);
     CHECK("slot 0 has a texture of the new size", g_snap[0].tex != old0 && g_snap[0].tex.width == 16);
     CHECK("slot 0's old texture is still resident", [g_snap_res containsAllocation:old0]);
@@ -243,10 +249,118 @@ static void queued_case(void) {
     h_nvnWindowFinalize((NVNwindow *)&win); h_nvnQueueFinish(&fixture_queue);
     h_nvnCommandBufferFinalize(&command); h_nvnEventFinalize(&event); h_nvnMemoryPoolFinalize(&pool); free(memory);
 }
+// The acquire's wait for the screen without the display link (mtl_present_screen_wait, DM_PRESENT_DEPTH 1): presents queued against the newest one the presented handlers reported
+static void *screen_report_later(void *arg) { usleep(20000); pres_seen((uint64_t)(uintptr_t)arg, -1); return NULL; }
+static void screen_case(void) {
+    const double per = 0.02;   // timeout 2 periods = 40 ms
+    pthread_mutex_lock(&g_pq_mu); uint64_t base = g_pq_in; pthread_mutex_unlock(&g_pq_mu);
+    // A screen that has reported no present at all (newest seen 0: a window covered from its first frame, a headless run): one timeout, then no more waits
+    if (!atomic_load(&g_pres_seen)) {
+        pthread_mutex_lock(&g_pq_mu); g_pq_in = base + 3; pthread_mutex_unlock(&g_pq_mu);
+        uint64_t to0 = atomic_load(&g_sdw_to), t0 = now_ns(), w = mtl_present_screen_wait(per), dt = now_ns() - t0;
+        CHECK("screen: no report ever, the first wait times out after two periods", w > 0 && dt >= 38000000ull && atomic_load(&g_sdw_to) == to0 + 1);
+        int fast = 1;
+        for (int i = 0; i < 3; i++) { t0 = now_ns(); w = mtl_present_screen_wait(per); fast &= w == 0 && now_ns() - t0 < 5000000ull; }
+        CHECK("screen: no report ever, then no wait while it stays silent (newest seen 0)", fast);
+        pthread_mutex_lock(&g_pq_mu); g_pq_in = base; pthread_mutex_unlock(&g_pq_mu);
+        pres_seen(base + 1, -1); base++;   // the screen's first report ends the silence
+        pthread_mutex_lock(&g_pq_mu); g_pq_in = base; pthread_mutex_unlock(&g_pq_mu);
+    }
+    pres_seen(base, -1);
+    pthread_mutex_lock(&g_pq_mu); g_pq_in = base + 1; pthread_mutex_unlock(&g_pq_mu);
+    uint64_t t0 = now_ns(); uint64_t w = mtl_present_screen_wait(per);
+    CHECK("screen: one present not yet shown, depth 1: no wait", w == 0 && now_ns() - t0 < 5000000ull && g_sdw_depth == 1);
+    pthread_mutex_lock(&g_pq_mu); g_pq_in = base + 3; pthread_mutex_unlock(&g_pq_mu);
+    pthread_t th; pthread_create(&th, NULL, screen_report_later, (void *)(uintptr_t)(base + 2));
+    t0 = now_ns(); w = mtl_present_screen_wait(per); uint64_t dt = now_ns() - t0; pthread_join(th, NULL);
+    CHECK("screen: three queued waits until the screen reports the second", w > 0 && dt >= 15000000ull && dt < 38000000ull);
+    pthread_mutex_lock(&g_pq_mu); g_pq_in = base + 5; pthread_mutex_unlock(&g_pq_mu);
+    uint64_t to0 = atomic_load(&g_sdw_to); t0 = now_ns(); w = mtl_present_screen_wait(per); dt = now_ns() - t0;
+    CHECK("screen: a silent screen times out after two periods", w > 0 && dt >= 38000000ull && dt < 80000000ull && atomic_load(&g_sdw_to) == to0 + 1);
+    t0 = now_ns(); w = mtl_present_screen_wait(per);
+    CHECK("screen: then no wait while the screen stays silent", w == 0 && now_ns() - t0 < 5000000ull);
+    pthread_create(&th, NULL, screen_report_later, (void *)(uintptr_t)(base + 3)); pthread_join(th, NULL);
+    t0 = now_ns(); w = mtl_present_screen_wait(per); dt = now_ns() - t0;
+    CHECK("screen: a new report brings the wait back", w > 0 && dt >= 38000000ull);
+    pres_seen(base + 5, -1);
+    t0 = now_ns(); w = mtl_present_screen_wait(per);
+    CHECK("screen: all shown, no wait", w == 0 && now_ns() - t0 < 5000000ull);
+    // counted in the game's presents: the game recorded frame 1002's present while the replay has queued only up to frame 1000's (a stale g_pq_in would release at once)
+    pthread_mutex_lock(&g_pq_mu); g_pq_in = base + 10; pthread_mutex_unlock(&g_pq_mu);
+    g_pres_frm[(base + 10) % PRING] = 1000; g_pres_frm[(base + 11) % PRING] = 1001;
+    pres_seen(base + 10, -1); mtl_present_recorded(1002);
+    pthread_create(&th, NULL, screen_report_later, (void *)(uintptr_t)(base + 11));
+    t0 = now_ns(); w = mtl_present_screen_wait(per); dt = now_ns() - t0; pthread_join(th, NULL);
+    CHECK("screen: counted in the game's presents, waits for frame 1001's present although the replay's count is caught up", w > 0 && dt >= 15000000ull && dt < 38000000ull && atomic_load(&g_seen_frame) == 1001);
+    t0 = now_ns(); w = mtl_present_screen_wait(per);
+    CHECK("screen: frame 1001 shown, frame 1002 recorded: no wait at depth 1", w == 0 && now_ns() - t0 < 5000000ull);
+    atomic_store(&g_rec_frame, 0);
+    pthread_mutex_lock(&g_pq_mu); g_pq_in = base; pthread_mutex_unlock(&g_pq_mu);
+}
+// With present snapshots the game runs a frame ahead of the screen on purpose and their ring paces it: the screen wait stays off, as the display link's drain does
+static void screen_snap_case(void) {
+    pthread_mutex_lock(&g_pq_mu); uint64_t base = g_pq_in; g_pq_in = base + 3; pthread_mutex_unlock(&g_pq_mu);
+    uint64_t t0 = now_ns(), w = mtl_present_screen_wait(0.02);
+    CHECK("screen: with present snapshots, three queued and none shown: no wait", mtl_snap_on() && w == 0 && now_ns() - t0 < 5000000ull);
+    pthread_mutex_lock(&g_pq_mu); g_pq_in = base; pthread_mutex_unlock(&g_pq_mu);
+}
+static tex_t source_flat(unsigned i, int n, int v) { return source_tex(90101 + i, n, v); }   // n x n texels of value v (any n), RGBA8
+// The colour channels of an 8 x 8 block in the middle of t (BGRA8), all within tol of value
+static void pixels_near(id<MTLTexture> t, int value, int tol, const char *what) {
+    id<MTLBuffer> out = read_block(t, t.width / 2 - 4, t.height / 2 - 4);
+    int bad = 0, worst = 0; for (int i = 0; i < 256; i++) { if (i % 4 == 3) continue; int d = abs((int)((uint8_t *)out.contents)[i] - value); if (d > worst) worst = d; bad += d > tol; }
+    char b2[160]; snprintf(b2, sizeof b2, "%s (worst channel error %d)", what, worst); CHECK(b2, bad == 0);
+}
+// The MetalFX scaler at the snapshot (DM_PRESENT_FX_AT_SNAP): a 64 x 64 picture presented on a 256 x 256 canvas is scaled into the ring slot's up texture by the snapshot's command
+// buffer, present_now would draw it 1:1 (snap_up_for), a canvas change replaces up (the old one resident until the slot's next use, the scaler remade once the queued snapshots ran),
+// and a present on a canvas other than the snapshot's falls back to the raw copy
+static void fx_snap_case(void) {
+    if (fx_mode() != 1) { printf("present upscaling unavailable on this device: the MetalFX-at-snapshot case is skipped\n"); return; }
+    g_snap_canvas_test[0] = g_snap_canvas_test[1] = 256; g_snap_canvas_test_pf = MTLPixelFormatBGRA8Unorm;
+    tex_t t = source_flat(0, 64, 100);
+    snap_present(&t); snap_present(&t);
+    CHECK("both snapshots completed", [g_snap_ev waitUntilSignaledValue:g_snap_v timeoutMS:4000]);
+    CHECK("the snapshot scaler was made once", g_fx_snap.sc != nil && g_fx_snap.made == 1 && g_fx_snap.out == nil);
+    CHECK("slot 0 has a scaled picture of the canvas rectangle's size", g_snap[0].up_valid && g_snap[0].up.width == 256 && g_snap[0].up.height == 256 && g_snap[0].up.pixelFormat == MTLPixelFormatBGRA8Unorm && g_snap[0].up_gen == 1);
+    CHECK("slot 1 too, and both are resident", g_snap[1].up_valid && g_snap[1].up.width == 256 && [g_snap_res containsAllocation:g_snap[0].up] && [g_snap_res containsAllocation:g_snap[1].up]);
+    pixels(g_snap[0].tex, 100);   // the raw copy stays (the fallback's and the screenshots' source); its 8 x 8 corner
+    pixels_near(g_snap[0].up, 100, 3, "the scaled picture holds the flat colour");
+    id<MTLTexture> up = nil; MTLViewport vp;
+    CHECK("a present on the snapshot's canvas draws the scaled picture 1:1", snap_up_for(0, 1, 256, 256, MTLPixelFormatBGRA8Unorm, &up, &vp) && up == g_snap[0].up && vp.originX == 0 && vp.originY == 0 && vp.width == 256 && vp.height == 256);
+    CHECK("a present on a resized canvas falls back to the raw copy", !snap_up_for(0, 1, 300, 256, MTLPixelFormatBGRA8Unorm, &up, &vp) && !snap_up_for(0, 1, 256, 256, MTLPixelFormatBGRA8Unorm_sRGB, &up, &vp));
+    CHECK("another snapshot count of the slot does not match", !snap_up_for(0, 2, 256, 256, MTLPixelFormatBGRA8Unorm, &up, &vp));
+    uint64_t fb = g_snap_fx_fallback; snap_up_stale(0, 1); snap_up_stale(0, 7); CHECK("a stale picture counts one fallback", g_snap_fx_fallback == fb + 1);
+    // The canvas changes (a window resize): the next snapshots scale for 128 x 96 (a 4:3 canvas: the picture's rectangle is 96 x 96 at x 16), the old up textures stay resident until each slot's next use
+    id<MTLTexture> old0 = g_snap[0].up, old1 = g_snap[1].up;
+    id<MTLSharedEvent> gpu_gate = new_gate(); [g_q4 waitForEvent:gpu_gate value:1];   // stands for display command buffers still queued, which may read old0 / old1
+    g_snap_canvas_test[0] = 128; g_snap_canvas_test[1] = 96;
+    uint64_t t0 = now_ns(); snap_present(&t); double ms = (now_ns() - t0) / 1e6;
+    CHECK("the scaler is remade for the new canvas", g_fx_snap.made == 2 && g_fx_snap.ow == 96 && g_fx_snap.oh == 96);
+    CHECK("slot 0's scaled picture has the new rectangle's size, at its place on the canvas", g_snap[0].up != old0 && g_snap[0].up.width == 96 && g_snap[0].up.height == 96 && g_snap[0].up_vx == 16 && g_snap[0].up_vy == 0 && g_snap[0].up_gen == 2);
+    CHECK("slot 0's old scaled picture is still resident", g_snap[0].old_up == old0 && [g_snap_res containsAllocation:old0]);
+    printf("the first snapshot after the canvas change took %.1f ms (the scaler's remake waits for the queued snapshots: the gate was closed, so it waited for nothing queued after it)\n", ms);
+    snap_present(&t);
+    CHECK("slot 1's old scaled picture is still resident", g_snap[1].old_up == old1 && [g_snap_res containsAllocation:old1]);
+    gpu_gate.signaledValue = 1;
+    CHECK("the replacing snapshots complete", [g_snap_ev waitUntilSignaledValue:g_snap_v timeoutMS:4000]);
+    snap_present(&t);
+    CHECK("slot 0's old scaled picture leaves at the slot's next use", !g_snap[0].old_up && ![g_snap_res containsAllocation:old0] && [g_snap_res containsAllocation:g_snap[0].up]);
+    CHECK("slot 1's old scaled picture waits for its own slot", [g_snap_res containsAllocation:old1]);
+    CHECK("the snapshot completes", [g_snap_ev waitUntilSignaledValue:g_snap_v timeoutMS:4000]);
+    pixels_near(g_snap[0].up, 100, 3, "the picture scaled for the new canvas holds the flat colour");
+    CHECK("a present on the new canvas draws it 1:1 at x 16", snap_up_for(0, 3, 128, 96, MTLPixelFormatBGRA8Unorm, &up, &vp) && vp.originX == 16 && vp.width == 96 && vp.height == 96);
+    // The snapshot's GPU time is recorded by its version, for @snap_gpu_ms
+    CHECK("the snapshot command buffer's GPU time is recorded", g_snap_gpu[g_snap_v % PRING].v == g_snap_v && g_snap_gpu[g_snap_v % PRING].ms > 0);
+    // With the switch off the raw copy alone is taken and the slot's picture is not valid for the present
+    g_snap_canvas_test[0] = 0;   // no canvas: as with no layer
+    snap_present(&t); CHECK("the snapshot completes without a canvas", [g_snap_ev waitUntilSignaledValue:g_snap_v timeoutMS:4000]);
+    CHECK("no canvas: the slot's scaled picture is not offered to the present", !g_snap[1].up_valid && !snap_up_for(1, g_snap[1].up_gen, 128, 96, MTLPixelFormatBGRA8Unorm, &up, &vp));
+}
 int main(int argc, char **argv) { @autoreleasepool {
     alarm(15); setbuf(stdout, NULL);
     if (argc != 2) return 2;
-    setenv("DM_PRESENT_SNAP", "1", 1); setenv("DM_PRESENT_HZ", "0", 1);
+    setenv("DM_PRESENT_SNAP", strcmp(argv[1], "screen") ? "1" : "0", 1); setenv("DM_PRESENT_HZ", "0", 1);   // the screen wait is off with snapshots (screen_snap)
+    if (!strcmp(argv[1], "fxsnap")) setenv("DM_PRESENT_UPSCALE", "metalfx", 1);
     mtl_init();
     NVNdeviceBuilder db = {0}; h_nvnDeviceBuilderSetDefaults(&db); CHECK("fixture device initialized", h_nvnDeviceInitialize(&fixture_device, &db));
     NVNqueueBuilder qb = {0}; h_nvnQueueBuilderSetDefaults(&qb); h_nvnQueueBuilderSetDevice(&qb, &fixture_device);
@@ -257,6 +371,9 @@ int main(int argc, char **argv) { @autoreleasepool {
     else if (!strcmp(argv[1], "resize")) resize_case();
     else if (!strcmp(argv[1], "queued")) queued_case();
     else if (!strcmp(argv[1], "ticket")) ticket_case();
+    else if (!strcmp(argv[1], "screen")) screen_case();
+    else if (!strcmp(argv[1], "screen_snap")) screen_snap_case();
+    else if (!strcmp(argv[1], "fxsnap")) fx_snap_case();
     else return 2;
     printf("present snapshots: %d checks, %d failed\n", checks, failed); return failed != 0;
 } }

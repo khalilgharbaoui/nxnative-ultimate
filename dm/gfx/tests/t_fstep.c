@@ -18,16 +18,20 @@ static void run(sim *m, int n, double w, int kmin, int kmax, int fixed) {
     }
 }
 
+// A hitch that steps hold 1 up: six frames of 1.6 vsyncs (pipeline compiles), 3.6 vsyncs behind in the last 30 frames, more than FSTEP_LATE a frame on average. Three such
+// frames among frames on time are paid back by the step and keep hold 1 (below)
+static void hitch(sim *m) { run(m, 6, 1.6, 1, 3, 0); }
+
 int main(void) {
     {   // 120 fps (hle_nvn.c fps_high): kmin 1, kmax 2, in ticks of 1/120 s. The target follows the hold, so a hold above what frames take is the game at the right speed
-        sim m = {0}; m.s.per_vsync = 2;
+        sim m = {0}; m.s.per_vsync = 2; m.s.no_payback = 1;
         run(&m, 120, 0.7, 1, 2, 0); check(m.s.k == 1, "120 fps: frames of 5.8 ms hold 120");
         check(m.s.hold == FSTEP_HOLD0 * 2, "120 fps: the wait before a trial is the same real time");
         run(&m, 10, 1.6, 1, 2, 0); check(m.s.k == 2, "120 fps: frames of 13 ms step down to 60");
         run(&m, 600, 1.6, 1, 2, 0); check(m.s.k == 2, "120 fps: they stay at 60 while they do not fit");
         run(&m, 60, 4.0, 1, 2, 0); check(m.s.k == 2, "120 fps: 33 ms frames stop at 60, never a longer hold");
         run(&m, 1200, 0.7, 1, 2, 0); check(m.s.k == 1, "120 fps: frames that fit return to 120");
-        sim c = {0}; c.s.per_vsync = 2;
+        sim c = {0}; c.s.per_vsync = 2; c.s.no_payback = 1;
         run(&c, 120, 0.7, 1, 2, 0); run(&c, 30, 0.7, 2, 2, 0); check(c.s.k == 2, "120 fps: a cap of 60 (a movie, a 60 Hz screen) holds two ticks");
         run(&c, 120, 0.7, 1, 2, 0); check(c.s.k == 1, "120 fps: the cap's end returns to 120");
     }
@@ -40,6 +44,37 @@ int main(void) {
         check(m.s.k == 2 && m.s.ups == 1 && m.s.downs == 0, b);
         snprintf(b, sizeof b, "  game time %.0f against real time %.2f (debt %.2f)", m.game, m.real, m.s.debt);
         check(m.real - m.game - m.s.debt > -1.01 && m.real - m.game - m.s.debt < 1.01 && m.s.debt < 1, b);
+    }
+    {   // Mario Kart World on an M4 Max (issue #1823): frames scattered around one vsync, three in a row late by 4 ms every 20 frames, the rest on time. The rate holds 60
+        // and the step pays the late frames back, so hold 1 stays (three late frames alone stepped to 30 every second)
+        sim m = {0}; run(&m, 120, 0.5, 1, 3, 0);
+        for (int i = 0; i < 3000; i++) run(&m, 1, i % 20 < 3 ? 1.25 : 0.9, 1, 3, 0);
+        snprintf(b, sizeof b, "near-misses, 3 of every 20 frames late by 4 ms: hold 1 (k %d, ups %llu, late %llu)", m.s.k, (unsigned long long)m.s.ups, (unsigned long long)m.s.late);
+        check(m.s.k == 1 && m.s.ups == 0 && m.s.late >= 400, b);
+        snprintf(b, sizeof b, "  game time %.0f against real time %.2f (debt %.2f, paid %llu)", m.game, m.real, m.s.debt, (unsigned long long)m.s.paid);
+        check(m.real - m.game - m.s.debt > -1.01 && m.real - m.game - m.s.debt < 1.01 && m.s.paid > 0, b);
+        sim h = {0}; run(&h, 120, 0.5, 1, 3, 0); run(&h, 600, 0.9, 1, 3, 0); run(&h, 3, 1.6, 1, 3, 0); run(&h, 60, 0.9, 1, 3, 0);
+        check(h.s.k == 1 && h.s.ups == 0, "  a hitch of three 27 ms frames among frames on time: hold 1");
+    }
+    {   // a scene at 1.3 vsyncs whose eleventh late frame is a 50 ms hitch: the step goes to the cheapest of the last three (2), not to the hitch (3)
+        sim m = {0}; run(&m, 120, 0.5, 1, 3, 0); run(&m, 10, 1.3, 1, 3, 0);
+        check(m.s.k == 1, "scene at 1.3 vsyncs: ten late frames are 3 vsyncs behind, not yet short of hold 1");
+        run(&m, 1, 3.0, 1, 3, 0);
+        snprintf(b, sizeof b, "  a 3-vsync frame then: hold 2, not 3 (k %d)", m.s.k);
+        check(m.s.k == 2 && m.s.ups == 1, b);
+    }
+    {   // a game whose stub takes steps up to 2 (Mario Kart World's STEP_MAX): frames of 2.6 vsyncs stop at hold 2, and no step above 2 is handed out
+        sim m = {0}; m.s.smax = 2; int over = 0;
+        run(&m, 120, 0.5, 1, 3, 0);
+        for (int i = 0; i < 600; i++) { run(&m, 1, i < 300 ? 2.6 : 1.3, 1, 3, 0); over += m.next > 2; }
+        snprintf(b, sizeof b, "step cap 2: frames of 2.6 then 1.3 vsyncs hold 2 at most, steps at most 2 (k %d, steps over 2: %d)", m.s.k, over);
+        check(m.s.k == 2 && over == 0, b);
+        sim f = {0}; f.s.smax = 2; run(&f, 10, 0.5, 1, 3, 3);
+        check(f.s.k == 2 && f.next == 2, "  a step the game fixes at 3 is held at the cap");
+    }
+    {   // 120 fps (no payback: the game steps by its target, so a late frame is slow motion): three late frames step down to 60 whatever the average
+        sim m = {0}; m.s.per_vsync = 2; m.s.no_payback = 1; run(&m, 120, 0.7, 1, 2, 0); run(&m, 3, 1.25, 1, 2, 0);
+        check(m.s.k == 2, "120 fps, no payback: three frames late by 2 ms step down to 60");
     }
     {   sim m = {0}; run(&m, 120, 0.5, 1, 3, 0); run(&m, 300, 1.12, 1, 3, 0);   // 18.7 ms frames: 53 fps
         check(m.s.k == 2 && m.s.ups == 1, "steady 18.7 ms frames (53 fps): 30 fps, not 53 with a payback every 8 frames");
@@ -156,12 +191,12 @@ int main(void) {
         sim m = {0}; run(&m, 60, 0.5, 1, 3, 0); run(&m, 300, 1.3, 1, 3, 0); m.slow = 1;
         for (int i = 0; i < 1000 && m.s.probe != 2; i++) run(&m, 1, m.s.k == 1 ? 0.6 : 1.2, 1, 3, 0);
         double hold0 = m.s.hold; uint64_t failed = m.s.failed;
-        run(&m, 120, 0.6, 1, 3, 0); run(&m, 3, 1.5, 1, 3, 0);
+        run(&m, 120, 0.6, 1, 3, 0); hitch(&m);
         snprintf(b, sizeof b, "slowed, hold 1 lasts 2 s after the probe: counted as failed (failed %llu, hold-off %.0f → %.0f vsyncs)", (unsigned long long)m.s.failed, hold0, m.s.hold);
         check(m.s.k == 2 && m.s.failed == failed + 1 && m.s.hold == 2 * hold0 && m.s.probe == 0, b);
         for (int i = 0; i < 2000 && m.s.probe != 2; i++) run(&m, 1, m.s.k == 1 ? 0.6 : 1.2, 1, 3, 0);
         hold0 = m.s.hold; failed = m.s.failed;
-        run(&m, 600, 0.6, 1, 3, 0); run(&m, 3, 1.5, 1, 3, 0);
+        run(&m, 600, 0.6, 1, 3, 0); hitch(&m);
         snprintf(b, sizeof b, "  hold 1 lasts 10 s after the next probe: the hold-off returns to 1 s (failed %llu, hold-off %.0f → %.0f vsyncs)", (unsigned long long)m.s.failed, hold0, m.s.hold);
         check(m.s.k == 2 && m.s.failed == failed && hold0 == 120 && m.s.hold == FSTEP_HOLD0, b);
     }
@@ -193,6 +228,50 @@ int main(void) {
         for (int i = 0; i < 1200; i++) { double gp = i < 600 || m.s.k == 1 ? 0.03 : 0.17, w = i < 600 ? 0.5 : 1.3; m.slow = nvn_fstep_gpu_slowed(&g, gp, m.s.k ? m.s.k : 1, 1, m.s.probe); slowed |= m.slow; run(&m, 1, w, 1, 3, 0); }
         check(m.s.k == 2 && !slowed && m.s.probes == 0, "GPU 0.03 → 0.17 under CPU lag: a GPU at 3 ms is not called slowed, no probe");
     }
+    {   // Ocarina of Time on a Mac: GPU 0.75 at hold 1, an area's load steps to 3, where the clock falls: 1.3 with a frame of 2.0 in every 12 (no 30 frames in a row fit hold 2), and 1.0 at hold 2.
+        // One late frame 25 frames before the load: the load follows no run of FSTEP_RUN frames on time, so it is no one-off frame (nvn_fstep.h) and steps to 3, as this case needs
+        sim m = {0}; nvn_fgpu g = {0}; int at1 = 0, at3 = 0, at2 = 0;
+        for (int i = 0; i < 3000; i++) {
+            int k = m.s.k ? m.s.k : 1;
+            double w = i == 575 ? 1.2 : i < 600 ? 0.75 : i < 603 ? 3.4 : k == 3 ? (i % 12 ? 1.3 : 2.0) : k == 2 ? 1.0 : at1++ < 20 ? 1.0 : 0.75;
+            at3 += i >= 603 && k == 3; at2 += i >= 603 && k == 2;
+            m.slow = nvn_fstep_gpu_slowed(&g, i >= 600 && i < 603 ? 0.75 : w, k, 1, m.s.probe);   // the load's late frames are the CPU's
+            run(&m, 1, w, 1, 3, 0);
+        }
+        snprintf(b, sizeof b, "frames over the fit at hold 3 (OoT): a trial to 2, a probe to 1 (k %d, failed %llu, %d frames at hold 3, %d at hold 2)", m.s.k, (unsigned long long)m.s.failed, at3, at2);
+        check(m.s.k == 1 && m.s.probes == 1 && m.s.failed == 0 && at3 <= 40 && at2 <= 70, b);
+        sim c = {0};   // a mean that does not fit hold 2 keeps hold 3
+        run(&c, 575, 0.75, 1, 3, 0); run(&c, 1, 1.2, 1, 3, 0); run(&c, 24, 0.75, 1, 3, 0); run(&c, 3, 3.4, 1, 3, 0);
+        for (int i = 0; i < 2400; i++) run(&c, 1, i % 12 ? 1.75 : 2.0, 1, 3, 0);
+        check(c.s.k == 3 && c.s.downs == 0, "  a mean of 1.77 at hold 3 does not fit hold 2: no trial");
+    }
+    {   // a scene at the edge that holds 60 (0.8, one frame in 10 at 1.05, none late at hold 1): a load's ten late frames step to 2 with nothing learned at hold 1 and the GPU as fast as before
+        sim m = {0}; int at2 = 0;
+        for (int i = 0; i < 3000; i++) {
+            double w = i >= 300 && i < 310 ? 1.4 : i % 10 ? 0.8 : 1.05;
+            at2 += i >= 310 && m.s.k == 2;
+            run(&m, 1, w, 1, 3, 0);
+        }
+        snprintf(b, sizeof b, "edge scene after a hitch (OoT): frames of 1.05 among 0.8 do not keep hold 2 (k %d, ups %llu, failed %llu, %d frames at hold 2)", m.s.k, (unsigned long long)m.s.ups, (unsigned long long)m.s.failed, at2);
+        check(m.s.k == 1 && m.s.ups == 1 && m.s.failed == 0 && at2 <= 70, b);
+    }
+    {   // issue #2400 (OoT on an M4): 26 ms frames at hold 3 with every sixth at 30 or 31.7 ms, over the fit of hold 2 (28.3 ms) but all on time there
+        for (int v = 0; v < 2; v++) {
+            sim m = {0}; int at3 = 0; run(&m, 60, 0.5, 1, 3, 0); run(&m, 3, 3.5, 1, 3, 0);
+            for (int i = 0; i < 600; i++) { at3 += m.s.k == 3; run(&m, 1, i % 6 == 5 ? (v ? 1.9 : 1.8) : 1.56, 1, 3, 0); }
+            snprintf(b, sizeof b, "1.56 at hold 3, every sixth %.1f: hold 2 and it holds (k %d, %d frames at hold 3, failed %llu)", v ? 1.9 : 1.8, m.s.k, at3, (unsigned long long)m.s.failed);
+            check(m.s.k == 2 && at3 <= 120 && m.s.failed == 0, b);
+        }
+    }
+    {   // the cost of the mean: a scene at the edge whose mean fits hold 1 (0.7, a quarter of its frames at 1.3, late there) goes back and forth between holds 1 and 2,
+        // its trials held and the hold stepping up again later, about once per FSTEP_HOLD_MAX (the per-frame rule kept hold 2 for good); this pins that rate
+        sim m = {0}; uint32_t r = 1; run(&m, 10, 1.6, 1, 3, 0);
+        double t0 = m.real;
+        for (int i = 0; i < 36000; i++) { r = r * 1664525u + 1013904223u; run(&m, 1, (r >> 8) % 4 ? 0.7 : 1.3, 1, 3, 0); }
+        double cap = (m.real - t0) / FSTEP_HOLD_MAX;
+        snprintf(b, sizeof b, "  edge scene with a heavy tail: steps down at most once per 8 s (downs %llu, at most %.0f, failed %llu)", (unsigned long long)m.s.downs, cap, (unsigned long long)m.s.failed);
+        check(m.s.downs <= cap, b);
+    }
     {   // the GPU stays slow at hold 1 too: each probe fails, the reference stays the hold-1 time from before, and the probes spread out
         sim m = {0}; nvn_fgpu g = {0}; double last = 0, gaps[4]; int ng = 0; uint64_t probes = 0;
         for (int i = 0; i < 6000 && ng < 4; i++) {
@@ -206,11 +285,11 @@ int main(void) {
         snprintf(b, sizeof b, "  probes %.0f, %.0f, %.0f vsyncs apart; game time %.0f against real time %.2f (debt %.2f)", gaps[1], gaps[2], gaps[3], m.game, m.real, m.s.debt);
         check(gaps[1] >= 120 && gaps[2] >= 240 && gaps[3] >= 480 && m.real - m.game - m.s.debt > -1.01 && m.real - m.game - m.s.debt < 1.01, b);
     }
-    {   // Breath of the Wild on an iPhone (2026-10-21): frames of 0.80 / 0.92 vsyncs at hold 1 for 20 s, three pipeline compiles step to 2, and the scene costs the same there:
+    {   // Breath of the Wild on an iPhone (2026-10-21): frames of 0.80 / 0.92 vsyncs at hold 1 for 20 s, pipeline compiles step to 2, and the scene costs the same there:
         // every other frame is above FSTEP_FIT, so no 30 fit in a row; the cost that held hold 1 starts one probe, which holds
         sim m = {0};
         for (int i = 0; i < 1200; i++) run(&m, 1, i % 2 ? 0.92 : 0.80, 1, 3, 0);
-        run(&m, 3, 1.6, 1, 3, 0);
+        hitch(&m);
         int stepped = m.s.k == 2; double ref = m.s.cref;
         for (int i = 0; i < 600; i++) run(&m, 1, i % 2 ? 0.92 : 0.80, 1, 3, 0);
         snprintf(b, sizeof b, "hitch after 20 s at hold 1, same cost at hold 2 (BotW): one probe back that holds (k %d, probes %llu, failed %llu)", m.s.k, (unsigned long long)m.s.probes, (unsigned long long)m.s.failed);
@@ -229,13 +308,13 @@ int main(void) {
     {   // hold 1 held only 5 s before the hitch: that run proves nothing (a device that steps up every few seconds keeps 30 rather than flap)
         sim m = {0};
         for (int i = 0; i < 300; i++) run(&m, 1, i % 2 ? 0.92 : 0.80, 1, 3, 0);
-        run(&m, 3, 1.6, 1, 3, 0);
+        hitch(&m);
         for (int i = 0; i < 2000; i++) run(&m, 1, i % 2 ? 0.92 : 0.80, 1, 3, 0);
         check(m.s.k == 2 && m.s.probes == 0 && m.s.cref == 0, "hitch after 5 s at hold 1: no cost that held, no probe");
     }
     {   // the cost at hold 2 is what held, but hold 1 no longer fits (1.3 there): each probe fails, the probes spread out 1 → 2 → 4 → 8 s, and the cost that held is kept
         sim m = {0}; double last = 0, gaps[5]; int ng = 0; uint64_t probes = 0;
-        run(&m, 1200, 0.86, 1, 3, 0); run(&m, 3, 1.6, 1, 3, 0);
+        run(&m, 1200, 0.86, 1, 3, 0); hitch(&m);
         for (int i = 0; i < 6000 && ng < 5; i++) {
             run(&m, 1, m.s.k == 1 ? 1.3 : 0.86, 1, 3, 0);
             if (m.s.probes != probes) { probes = m.s.probes; gaps[ng++] = m.real - last; last = m.real; }
@@ -252,7 +331,7 @@ int main(void) {
         check(sustained ? m.s.cref_at[1] > 0.85 && m.s.cref_at[1] < 0.87 : m.s.cref_at[1] == 0,
               sustained ? "first movie after 20 s at 60: save the sustained run without an earlier hitch"
                         : "first movie after only 5 s at 60: no proven cost to save");
-        run(&m, 60, 0.86, 1, 3, 0); uint64_t probes = m.s.probes; run(&m, 3, 1.6, 1, 3, 0);
+        run(&m, 60, 0.86, 1, 3, 0); uint64_t probes = m.s.probes; hitch(&m);
         for (int i = 0; i < 1200; i++) run(&m, 1, m.s.k == 1 ? 0.86 : 0.9, 1, 3, 0);
         check(sustained ? m.s.k == 1 && m.s.probes > probes : m.s.k == 2 && m.s.probes == probes,
               sustained ? "  hitch 1 s after the first movie: the saved run brings 60 back"
@@ -265,17 +344,17 @@ int main(void) {
         run(&m, 1200, 0.6, 1, 3, 0); run(&m, 120, 0.5, 2, 2, 0);
         check(m.s.cref_at[1] > 0.59 && m.s.cref_at[1] < 0.61, "  another sustained run before a movie: update the proven cost");
     }
-    {   sim m = {0}; run(&m, 1200, 0.86, 1, 3, 0); run(&m, 3, 1.6, 1, 3, 0); double held = m.s.cref; run(&m, 1, 0.5, 2, 3, 0);
+    {   sim m = {0}; run(&m, 1200, 0.86, 1, 3, 0); hitch(&m); double held = m.s.cref; run(&m, 1, 0.5, 2, 3, 0);
         check(held > 0.85 && m.s.cref == 0 && m.s.run <= 2, "movie flag (kmin 2): the cost that held kmin 1 is set aside");
         run(&m, 120, 0.5, 2, 3, 0); run(&m, 1, 0.5, 1, 3, 0);
         check(m.s.cref == held, "  movie ends (kmin 1): the cost that held kmin 1 comes back");
     }
     {   // Tears of the Kingdom's prerendered movies set a 30 cap (kmin 2). A GPU-bound game at 0.86 vsyncs at hold 1 and 0.9 at hold 2 (the clock lowered for the longer hold)
-        // has learned the cost that held hold 1 from a hitch; after a 10 s movie, pipeline compiles 1 s in (three frames of 1.6) step it up before 8 s at hold 1 relearn it
-        sim m = {0}; run(&m, 1200, 0.86, 1, 3, 0); run(&m, 3, 1.6, 1, 3, 0);
+        // has learned the cost that held hold 1 from a hitch; after a 10 s movie, pipeline compiles 1 s in (hitch) step it up before 8 s at hold 1 relearn it
+        sim m = {0}; run(&m, 1200, 0.86, 1, 3, 0); hitch(&m);
         for (int i = 0; i < 1200; i++) run(&m, 1, m.s.k == 1 ? 0.86 : 0.9, 1, 3, 0);
         double held = m.s.cref; int at1 = 0;
-        run(&m, 600, 0.5, 2, 2, 0); run(&m, 60, 0.86, 1, 3, 0); run(&m, 3, 1.6, 1, 3, 0);
+        run(&m, 600, 0.5, 2, 2, 0); run(&m, 60, 0.86, 1, 3, 0); hitch(&m);
         for (int i = 0; i < 1200; i++) { run(&m, 1, m.s.k == 1 ? 0.86 : 0.9, 1, 3, 0); at1 += i >= 600 && m.s.k == 1; }
         snprintf(b, sizeof b, "  a hitch 1 s after a movie: the cost that held hold 1 starts a probe (k %d, at hold 1 %d of the last 600)", m.s.k, at1);
         check(held > 0.85 && m.s.k == 1 && at1 == 600, b);
@@ -360,11 +439,20 @@ int main(void) {
             check(first_len == want[c] && m.s.k == 2 && m.s.failed == 1, b);
         }
     }
-    for (int ramp = 0; ramp <= 1; ramp++) {   // A one-off frame (nvn_fstep.h): no hold absorbs it (cost above kmax), and it breaks a run of frames on time; ramp 1 is the host's default
-        // Ocarina of Time's first scene frames after loading a save (replay, M4 Max, in vsyncs): a loading screen at 0.01, its first frame 9.8 = 164 ms, a 7.2 = 119 ms upload
-        // frame among frames of 1.8-2.1 while the GPU clock left low by the loading screen rises. Before, the three late frames stepped to the one-off frame's cost, hold 3, and the clock
-        // stayed low at 50 ms a frame until a probe 34 frames later
-        static const double burst[] = {9.8, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 2.0, 7.2, 2.1, 1.8, 1.8, 1.7, 1.6, 1.5, 1.4, 1.3, 1.2, 1.1, 1.0, 0.9};
+    {   // A drain of standing frames (nvn_fstep_drain_cut), in ms against a 16.7 ms hold
+        uint64_t pw = 20; check(nvn_fstep_drain_cut(33, 17, 16, 0, &pw) == 17 && pw == 4, "a drain of one tick: the frame shows its hold, the pacing wait loses the tick");
+        pw = 10; check(nvn_fstep_drain_cut(17, 17, 6, 0, &pw) == 17 && pw == 10, "a drain inside the hold is pacing: nothing cut");
+        pw = 10; check(nvn_fstep_drain_cut(30, 17, 6, 0, &pw) == 24 && pw == 4, "a late frame keeps its lateness beyond the drain");
+        pw = 12; check(nvn_fstep_drain_cut(34, 33, 5, 0, &pw) == 33 && pw == 11, "only the part past the hold is cut (hold 2)");
+        pw = 2; check(nvn_fstep_drain_cut(33, 17, 0, 16, &pw) == 17 && pw == 2, "a drain in a later acquire of the previous frame: the time, not the pacing wait");
+        pw = 3; check(nvn_fstep_drain_cut(40, 17, 9, 0, &pw) == 37 && pw == 0, "a drain counted no larger than the pacing wait it was part of");
+        pw = 0; check(nvn_fstep_drain_cut(0, 17, 0, 5, &pw) == 0, "the first frame (no previous start): nothing to cut");
+    }
+    for (int ramp = 0; ramp <= 1; ramp++) {   // A one-off frame (nvn_fstep.h): no hold absorbs it (cost above kmax), and it follows a run of frames on time; ramp 1 is the host's default
+        // Ocarina of Time's first frames after loading a save (replay, M4 Max, in vsyncs): a loading screen at 0.01, the load's GPU-heavy frame and its long frame (here one frame
+        // of 7.4 = 123 ms), 13 cheap frames, then the scene's first frames 2.1, a 6.5 = 108 ms upload frame and frames of 0.9-2.4 while their cost falls. Before, those three late
+        // frames passed the average and stepped the hold up (to 2 in the game, to 3 here, where a frame's cost is its time) until a probe about 30 frames later
+        static const double burst[] = {7.4, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 2.1, 6.5, 2.4, 2.2, 1.7, 2.3, 1.9, 2.1, 1.3, 1.2, 1.1, 1.3, 1.1, 1.0, 0.9};
         sim m = {0}; m.s.ramp = ramp; run(&m, 600, 0.01, 1, 3, 0);
         int kmax_seen = 1; for (size_t i = 0; i < sizeof burst / sizeof *burst; i++) { run(&m, 1, burst[i], 1, 3, 0); if (m.s.k > kmax_seen) kmax_seen = m.s.k; }
         run(&m, 600, 0.75, 1, 3, 0); if (m.s.k > kmax_seen) kmax_seen = m.s.k;
@@ -372,37 +460,61 @@ int main(void) {
         check(kmax_seen == 1 && m.s.ups == 0 && m.s.k == 1 && m.s.oneoffs == 1, b);
         snprintf(b, sizeof b, "  game time %.1f against real time %.1f (debt %.2f, dropped %.1f)", m.game, m.real, m.s.debt, m.s.dropped);
         check(m.real - m.game - m.s.debt - m.s.dropped > -1.01 && m.real - m.game - m.s.debt - m.s.dropped < 1.01, b);
-        // The scene after the one-off frame really needs hold 2: it steps up once the grace is over, and the grace is not renewed
-        sim h = {0}; h.s.ramp = ramp; run(&h, 600, 0.01, 1, 3, 0); run(&h, 1, 9.8, 1, 3, 0);
+        // When the grace ends the average starts over: three frames 0.3 late right after it are not a rate, though the grace's late frames are still within FSTEP_RUN of them
+        sim a = {0}; a.s.ramp = ramp; run(&a, 600, 0.01, 1, 3, 0); run(&a, 1, 7.4, 1, 3, 0); run(&a, 13, 0.25, 1, 3, 0); run(&a, 13, 2.0, 1, 3, 0);
+        run(&a, FSTEP_GRACE - 27, 0.9, 1, 3, 0); int g = a.s.grace; run(&a, 3, 1.3, 1, 3, 0); run(&a, 60, 0.9, 1, 3, 0);
+        snprintf(b, sizeof b, "  three late frames right after the grace: the average starts over, hold 1 (grace %d before, ups %llu)", g, (unsigned long long)a.s.ups);
+        check(g == 0 && a.s.ups == 0 && a.s.k == 1, b);
+        // The scene after the one-off frame really needs hold 2: it steps up once the grace is over and the new average shows it (0.5 a frame: 7 frames past FSTEP_LATE ×
+        // FSTEP_RUN), and the grace is not renewed
+        sim h = {0}; h.s.ramp = ramp; run(&h, 600, 0.01, 1, 3, 0); run(&h, 1, 7.4, 1, 3, 0);
         int at = -1; for (int i = 0; i < 200 && at < 0; i++) { run(&h, 1, 1.5, 1, 3, 0); if (h.s.k == 2) at = i; }
         run(&h, 600, 1.5, 1, 3, 0);
         snprintf(b, sizeof b, "  a scene after the one-off frame that needs hold 2 gets it after one grace (frame %d, k %d, ups %llu)", at, h.s.k, (unsigned long long)h.s.ups);
-        check(at >= 0 && at <= FSTEP_GRACE + 3 && h.s.k == 2 && h.s.ups == 1, b);
+        check(at >= FSTEP_GRACE - 1 && at <= FSTEP_GRACE + 7 && h.s.k == 2 && h.s.ups == 1, b);
         // Every frame above kmax (a device far too slow): only the first follows a run on time, so the hold still reaches kmax, one grace later at most
         sim d = {0}; d.s.ramp = ramp; run(&d, 120, 0.5, 1, 3, 0);
         at = -1; for (int i = 0; i < 200 && at < 0; i++) { run(&d, 1, 4.5, 1, 3, 0); if (d.s.k == 3) at = i; }
         snprintf(b, sizeof b, "  every frame above kmax: hold 3 within one grace (frame %d, one-off frames %llu)", at, (unsigned long long)d.s.oneoffs);
         check(at >= 0 && at <= FSTEP_GRACE + 3 && d.s.oneoffs == 1, b);
-        // A borderline scene with a spike every 30 frames, each right after one frame on time: only the first spike breaks a run of FSTEP_RUN on time, so the hold steps up after
-        // one grace (with one after any frame on time, every spike started a new grace and the scene stayed late at hold 1)
+        // A borderline scene with a spike every 30 frames, each right after one frame on time: only the first spike follows a run of FSTEP_RUN on time, so the hold steps up after
+        // one grace and the frames the new average needs (with one after any frame on time, every spike started a new grace and the scene stayed late at hold 1)
         sim p = {0}; p.s.ramp = ramp; run(&p, 600, 0.5, 1, 3, 0);
         at = -1; for (int r = 0, i = 0; r < 10; r++) { run(&p, 1, 4.0, 1, 3, 0); if (p.s.k > 1 && at < 0) at = i; i++; for (int j = 0; j < 28; j++, i++) { run(&p, 1, 1.2, 1, 3, 0); if (p.s.k > 1 && at < 0) at = i; } run(&p, 1, 0.5, 1, 3, 0); i++; }
-        snprintf(b, sizeof b, "  spikes every 30 frames, each after a frame on time, in a scene late at hold 1: one one-off frame, a step up within one grace (frame %d, one-off frames %llu)", at, (unsigned long long)p.s.oneoffs);
-        check(at >= 0 && at <= FSTEP_GRACE + 3 && p.s.oneoffs == 1, b);
+        snprintf(b, sizeof b, "  spikes every 30 frames, each after a frame on time, in a scene late at hold 1: one one-off frame, a step up after its grace (frame %d, one-off frames %llu)", at, (unsigned long long)p.s.oneoffs);
+        check(at >= FSTEP_GRACE - 1 && at <= 2 * FSTEP_RUN && p.s.oneoffs == 1, b);
     }
     {   // Where the rule does not apply. 120 fps (per_vsync 2, kmax 2): no step pays a debt back there, so a frame of 2.4 ticks after frames on time steps down to 60 as before
-        sim m = {0}; m.s.per_vsync = 2; run(&m, 120, 0.7, 1, 2, 0); run(&m, 1, 2.4, 1, 2, 0); run(&m, 3, 1.6, 1, 2, 0);
+        sim m = {0}; m.s.per_vsync = 2; m.s.no_payback = 1; run(&m, 120, 0.7, 1, 2, 0); run(&m, 1, 2.4, 1, 2, 0); run(&m, 3, 1.6, 1, 2, 0);
         snprintf(b, sizeof b, "120 fps: none, a late run still steps down to 60 (k %d, one-off frames %llu)", m.s.k, (unsigned long long)m.s.oneoffs);
         check(m.s.k == 2 && m.s.oneoffs == 0, b);
         // fps_hold off (kmax = kmin): the hold cannot step up, so a frame above kmax is not one either (and logs nothing)
         sim f = {0}; run(&f, 600, 0.5, 1, 1, 0); run(&f, 1, 4.0, 1, 1, 0); run(&f, 60, 1.3, 1, 1, 0);
         snprintf(b, sizeof b, "  kmax = kmin (fps_hold off): none (k %d, one-off frames %llu)", f.s.k, (unsigned long long)f.s.oneoffs);
         check(f.s.k == 1 && f.s.oneoffs == 0, b);
+        // A frame above every hold but kmax: 2.5 vsyncs after frames on time is late, not a one-off frame
+        sim e = {0}; run(&e, 120, 0.5, 1, 3, 0); run(&e, 1, 2.5, 1, 3, 0);
+        snprintf(b, sizeof b, "  a frame of 2.5 vsyncs (below kmax 3): none (one-off frames %llu)", (unsigned long long)e.s.oneoffs);
+        check(e.s.oneoffs == 0, b);
+        // The game's own step: frames under it are no run on time, so a costly frame right after it ends is not one
+        sim x = {0}; run(&x, 120, 0.5, 1, 3, 0); run(&x, 60, 0.5, 1, 3, 2); run(&x, 1, 4.0, 1, 3, 0);
+        snprintf(b, sizeof b, "  a costly frame right after the game's own step: none (one-off frames %llu)", (unsigned long long)x.s.oneoffs);
+        check(x.s.oneoffs == 0, b);
         // A trial at k - 1 in progress: a frame above kmax is not one, and the trial is judged as before
         sim t = {0}; run(&t, 120, 0.5, 1, 3, 0); run(&t, 30, 1.5, 1, 3, 0); run(&t, 600, 1.5, 1, 3, 0); run(&t, 30, 0.6, 1, 3, 0);
         int trial = t.s.trial; run(&t, 1, 4.0, 1, 3, 0);
         snprintf(b, sizeof b, "  a trial in progress: none (trial %d before, one-off frames %llu)", trial, (unsigned long long)t.s.oneoffs);
         check(trial > 0 && t.s.oneoffs == 0, b);
+        // Present snapshots at hold 2, 25 frames into a run that fits hold 1: a costly frame shown on time starts a grace, and no fit trial starts inside it (it would run
+        // there with its late frames neither failing it nor stepping up)
+        sim q = {0}; for (int i = 0; i < 200; i++) { q.s.screen = 1; nvn_fstep_next(&q.s, 1.0, 0.5, 1, 3, 0, 0); }
+        for (int i = 0; i < 3; i++) { q.s.screen = 2; nvn_fstep_next(&q.s, 1.0, 1.5, 1, 3, 0, 0); }
+        for (int i = 0; i < 30; i++) { q.s.screen = 1; nvn_fstep_next(&q.s, 2.0, 1.5, 1, 3, 0, 0); }
+        for (int i = 0; i < 25; i++) { q.s.screen = 1; nvn_fstep_next(&q.s, 2.0, 0.5, 1, 3, 0, 0); }
+        int k0 = q.s.k, fr = q.s.fit_run; q.s.screen = 1; nvn_fstep_next(&q.s, 2.0, 4.0, 1, 3, 0, 0);
+        for (int i = 0; i < 4; i++) { q.s.screen = 1; nvn_fstep_next(&q.s, 2.0, 0.5, 1, 3, 0, 0); }
+        snprintf(b, sizeof b, "  snapshots: no fit trial inside a one-off frame's grace (k %d → %d, fit run %d, one-off frames %llu, trial %d)", k0, q.s.k, fr, (unsigned long long)q.s.oneoffs, q.s.trial);
+        check(k0 == 2 && fr >= 25 && q.s.oneoffs == 1 && q.s.k == 2 && q.s.trial == 0, b);
         // Present snapshots: the screen shows a costly frame on time, so the run on time goes on; a second one inside the first one's grace starts no grace of its own
         sim n = {0}; for (int i = 0; i < 600; i++) { n.s.screen = 1; n.next = nvn_fstep_next(&n.s, 1.0, 0.5, 1, 3, 0, 0); }
         n.s.screen = 1; n.next = nvn_fstep_next(&n.s, 1.0, 4.0, 1, 3, 0, 0);

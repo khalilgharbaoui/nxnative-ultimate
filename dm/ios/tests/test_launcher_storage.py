@@ -29,9 +29,15 @@ class LauncherStorageTests(unittest.TestCase):
             # the window's cloud-save check calls the host's save_sync_report, which the app links as save_sync.o (dm/mac/pack_app.py)
             compile_result = subprocess.run(['xcrun', '-sdk', 'macosx', 'clang', '-I', str(REPO / 'dm/host'), '-c', '-o', str(sync), str(REPO / 'dm/host/save_sync.c')], capture_output=True, text=True, timeout=300)
             self.assertEqual(compile_result.returncode, 0, compile_result.stdout + compile_result.stderr)
+            archive = tmp / 'save_archive.o'
+            archive_result = subprocess.run(['xcrun', '-sdk', 'macosx', 'clang', '-O1', '-I', str(REPO / 'dm/host'), '-c', '-o', str(archive),
+                                             str(REPO / 'dm/host/save_archive.c')], capture_output=True, text=True, timeout=300)
+            self.assertEqual(archive_result.returncode, 0, archive_result.stdout + archive_result.stderr)
             compile_result = subprocess.run(['xcrun', '-sdk', 'macosx', 'swiftc', '-swift-version', '5', '-parse-as-library', '-module-cache-path', str(tmp / 'module-cache'),
-                            '-o', str(exe), str(REPO / 'dm/ios/Sources/LauncherSettings.swift'), str(REPO / 'dm/ios/Sources/LauncherRow.swift'), str(REPO / 'dm/ios/Sources/SaveSyncReport.swift'),
-                            str(REPO / 'dm/mac/Launcher.swift'), str(Path(__file__).with_name('launcher_layout_check.swift')), str(Path(__file__).with_name('launcher_storage_check.swift')), str(sync)],
+                            '-import-objc-header', str(REPO / 'dm/host/save_archive.h'),
+                            '-o', str(exe), str(REPO / 'dm/ios/Sources/LauncherSettings.swift'), str(REPO / 'dm/ios/Sources/LauncherRow.swift'), str(REPO / 'dm/ios/Sources/SaveSyncReport.swift'), str(REPO / 'dm/ios/Sources/SaveData.swift'),
+                            str(REPO / 'dm/mac/Launcher.swift'), str(Path(__file__).with_name('launcher_layout_check.swift')), str(Path(__file__).with_name('launcher_pad_check.swift')),
+                            str(Path(__file__).with_name('launcher_storage_check.swift')), str(sync), str(archive)],
                             capture_output=True, text=True, timeout=300)
             self.assertEqual(compile_result.returncode, 0, compile_result.stdout + compile_result.stderr)
             r = subprocess.run([str(exe), str(tmp / 'launcher.json'), str(tmp / 'launcher_mac.json')], capture_output=True, text=True, timeout=60)

@@ -51,12 +51,12 @@ def view(lib):
 def exists(lib): return os.path.isdir(folder_of(lib)) or os.path.isfile(image_of(lib))
 
 
-def read_stamp(lib):   # dmsh_chain.py read_stamp, on a folder or an image
+def read_stamp(lib):   # {'game': title ID, 'inputs': digest} of a library, a folder or its image (dmsh_chain.py write_stamp writes it); {} when it has none
     try: return dict(l.split('\t', 1) for l in (view(lib) / STAMP).read_text().splitlines() if '\t' in l and not l.startswith('#'))
     except OSError: return {}
 
 
-def table_head(lib):   # dmsh_chain.py table_head, on a folder or an image: the name is the folder's either way
+def table_head(lib):   # the header c1_full.tsv / cb_extent.tsv start with: the library's chain version (the folder's name, for an image too) and its inputs ("none" with no stamp, which nothing takes)
     return f'# chain {name_of(lib)} inputs {read_stamp(lib).get("inputs", "none")}'
 
 
@@ -73,8 +73,17 @@ def _names(folder):
 
 def write(files, dst):
     """files: {name: path to read (a romfs path may name a file inside an image), the bytes, or a function returning them (read only when its file is written: dmsh_build.py's outputs staged in the
-    shader cache, so that no library is held in memory whole)} → the image dst, by way of dst.part. A stopped write leaves only the .part, and an image is whole or absent"""
+    shader cache, so that no library is held in memory whole)} → the image dst, by way of dst.part. A failed write removes its .part, so a full drive gets its space back; a killed one leaves
+    only the .part. An image is whole or absent"""
     part = dst + '.part'
+    try: _write_part(files, part); os.replace(part, dst)
+    except BaseException:
+        try: os.unlink(part)
+        except OSError: pass
+        raise
+
+
+def _write_part(files, part):   # write()'s image, at part
     names = sorted((n.encode() for n in files))
     ents, off = [], romfs.HEAD.size
     with builtins.open(part, 'wb') as out:
@@ -98,7 +107,6 @@ def write(files, dst):
         out.write(idx); out.write(pool)
         out.seek(0); out.write(romfs.HEAD.pack(romfs.MAGIC, off, len(idx) + len(pool), len(names) + 1))
     romfs.Image(part)   # a read of it, as the host's check: nothing is published that a reader refuses
-    os.replace(part, dst)
 
 
 def pack(lib, say=print, leave_out=False):

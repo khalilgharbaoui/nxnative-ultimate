@@ -64,6 +64,46 @@ static void check(id<MTLTexture> src, const char *name, const int crop[4], int w
     EXPECT(name,0,bad);free(out);
 }
 
+#ifndef CROP_LEGACY_HEADER
+// A picture shown smaller than its texels (minification): the present filters each pixel's footprint with a Catmull-Rom kernel stretched by the scale (at most 3), two texels
+// an axis per bilinear fetch at the pair's weighted centre, fetch positions clamped to the crop's first and last texel centres (present.metal). The CPU model below is that filter
+static double bil_ref(const uint8_t *v, int w, int h, double u, double t) {   // channel 0 of an RGBA8 image, bilinear at texel coordinates (centres at +0.5)
+    u = fmin(fmax(u, 0.5), w - 0.5) - 0.5; t = fmin(fmax(t, 0.5), h - 0.5) - 0.5;
+    int x0 = (int)u, y0 = (int)t, x1 = x0 + 1 < w ? x0 + 1 : x0, y1 = y0 + 1 < h ? y0 + 1 : y0; double fx = u - x0, fy = t - y0;
+    return (v[4*(y0*w+x0)] * (1-fx) + v[4*(y0*w+x1)] * fx) * (1-fy) + (v[4*(y1*w+x0)] * (1-fx) + v[4*(y1*w+x1)] * fx) * fy;
+}
+static double cr_ref(double x) { x = fabs(x); return x < 1 ? (1.5 * x - 2.5) * x * x + 1 : x < 2 ? ((-0.5 * x + 2.5) * x - 4) * x + 2 : 0; }
+static double pair_ref(int a, int last, double c, double s, double *pos) {
+    double wa = cr_ref((a + 0.5 - c) / s), wb = a + 1 <= last ? cr_ref((a + 1.5 - c) / s) : 0, w = wa + wb;
+    *pos = a + 0.5 + (fabs(w) > 1e-6 ? fmin(fmax(wb / w, 0), 1) : 0.5); return w;
+}
+static double minify_ref(const uint8_t *v, int w, int h, int ow, int oh, int x, int y) {
+    double sx = fmin(fmax((double)w / ow, 1), 3), sy = fmin(fmax((double)h / oh, 1), 3), cx = (x + 0.5) * w / ow, cy = (y + 0.5) * h / oh, sum = 0, ws = 0;
+    int x0 = (int)ceil(cx - 0.5 - 2 * sx), xl = (int)floor(cx - 0.5 + 2 * sx), y0 = (int)ceil(cy - 0.5 - 2 * sy), yl = (int)floor(cy - 0.5 + 2 * sy);
+    for (int j = y0; j <= yl; j += 2) { double py, wy = pair_ref(j, yl, cy, sy, &py);
+        for (int i = x0; i <= xl; i += 2) { double px, wx = pair_ref(i, xl, cx, sx, &px); sum += wx * wy * bil_ref(v, w, h, px, py); ws += wx * wy; } }
+    return fmin(fmax(sum / ws, 0), 255);
+}
+// Presents a w x h image whose red channel is pattern(x, y) into an ow x oh square canvas (a 1:1 layer: the picture fills it); returns the red channel's largest difference from
+// the model and the spread (max - min) of the output's red channel between its first and last columns (those two take the edge clamp)
+static void check_minify(const char *name, int w, int h, int ow, int oh, uint8_t (*pattern)(int, int), int *maxdiff, int *spread) {
+    int flip = atomic_load(&g_origin_ll);   // lower-left origin: the image is stored bottom-up, so output row y is the model's row oh - 1 - y
+    MTLTextureDescriptor *sd=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:w height:h mipmapped:NO];sd.storageMode=MTLStorageModeShared;sd.usage=MTLTextureUsageShaderRead;
+    id<MTLTexture> s=[g_dev newTextureWithDescriptor:sd];uint8_t *px=calloc((size_t)w*h,4);
+    for(int y=0;y<h;y++)for(int x=0;x<w;x++){px[4*(y*w+x)]=pattern(x,y);px[4*(y*w+x)+3]=255;}
+    [s replaceRegion:MTLRegionMake2D(0,0,w,h) mipmapLevel:0 withBytes:px bytesPerRow:w*4];
+    MTLTextureDescriptor *od=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:ow height:oh mipmapped:NO];od.storageMode=MTLStorageModeShared;od.usage=MTLTextureUsageRenderTarget;
+    id<MTLTexture> dst=[g_dev newTextureWithDescriptor:od];id<MTLCommandBuffer> cb=[g_q commandBuffer];
+    EXPECT(name,1,ENCODE(cb,s,dst,NULL));[cb commit];[cb waitUntilCompleted];
+    uint8_t *o=malloc((size_t)ow*oh*4);[dst getBytes:o bytesPerRow:ow*4 fromRegion:MTLRegionMake2D(0,0,ow,oh) mipmapLevel:0];
+    int md=0,lo=255,hi=0;
+    for(int y=0;y<oh;y++)for(int x=0;x<ow;x++){int r=o[4*(y*ow+x)],d=abs(r-(int)lround(minify_ref(px,w,h,ow,oh,x,flip?oh-1-y:y)));md=d>md?d:md;if(x>0&&x<ow-1){lo=r<lo?r:lo;hi=r>hi?r:hi;}}
+    *maxdiff=md;*spread=hi-lo;free(px);free(o);
+}
+static uint8_t stripes(int x, int y) { (void)y; return x & 1 ? 255 : 0; }   // the finest detail a picture holds: one texel on, one off
+static uint8_t ramp(int x, int y) { return (uint8_t)((x * 37 + y * 91) & 255); }
+#endif
+
 // This fixture is the only present producer. A window now holds a logical queue receipt;
 // wait for replay, then for the display ticket (snapshots do not return that ticket).
 static uint64_t display_ticket(uint64_t receipt, uint64_t before) {
@@ -97,6 +137,23 @@ int main(void) { @autoreleasepool {
     check(src,"non-zero x and y offset, 16 pixels byte-identical to a hand-written sub-rectangle",inset,4,4,-2);
     check(src,"aspect of the valid area kept, 128 pixels red in the middle / black on both sides",tl,16,8,4);
 #ifndef CROP_LEGACY_HEADER
+    if (getenv("DM_PRESENT_MINIFY") && atoi(getenv("DM_PRESENT_MINIFY"))) {   // Minification (DM_PRESENT_MINIFY=1, off by default): 3:2 (a 2560x1440 frame in a 1920x1080 rectangle), 2:1 (a 1280x720 window), 5:1 (the kernel's width capped at 3:1) and 1:1
+        int md,sp;
+        check_minify("3:2 stripes present",12,12,8,8,stripes,&md,&sp);
+        EXPECT("3:2 stripes match the footprint filter within 1",1,md<=1);
+        // one bilinear tap gave columns of 64 and 191 here (spread 127): the stripes aliased into a coarser pattern of their own
+        EXPECT("3:2 stripes: spread at most 50 (one tap: 127)",1,sp<=50);
+        check_minify("2:1 ramp present",16,16,8,8,ramp,&md,&sp);
+        EXPECT("2:1 ramp matches the filter within 1",1,md<=1);
+        check_minify("5:1 ramp present",40,40,8,8,ramp,&md,&sp);
+        EXPECT("5:1 ramp matches the filter at 3:1 width within 1",1,md<=1);
+        check_minify("1:1 ramp present",8,8,8,8,ramp,&md,&sp);
+        EXPECT("1:1 ramp: the texels as they are",0,md);
+        atomic_store(&g_origin_ll,1);
+        check_minify("3:2 ramp present, lower-left origin",24,24,16,16,ramp,&md,&sp);
+        EXPECT("3:2 ramp with the lower-left origin is the filter's picture upside down, within 1",1,md<=1);
+        atomic_store(&g_origin_ll,0);
+    }
     {
         // sRGB swapchain: present sends the raw bytes (as the Switch's scan-out does) without decoding first; unfixed, 128/64/200 decode to about 55/13/148
         MTLTextureDescriptor *sd=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm_sRGB width:8 height:8 mipmapped:NO];sd.storageMode=MTLStorageModeShared;sd.usage=MTLTextureUsageShaderRead;
@@ -170,11 +227,57 @@ int main(void) { @autoreleasepool {
         EXPECT("resizing keeps the previous scaler until replacement",1,g_fx_present.sc==first);
         g_present_n=31;
         EXPECT("stable new size makes its scaler",PRESENT_METALFX,check_present_resize(big,192,96));
-        EXPECT("replacement has the new picture size",96,(int)g_fx_present.out.width);
+        EXPECT("replacement has the new picture size",96,(int)g_fx_present.sc.outputWidth);
         EXPECT("exactly two scalers made",2,g_fx_present.made);
         g_present_n=32;
         EXPECT("same size reuses its scaler",PRESENT_METALFX,check_present_resize(big,192,96));
         EXPECT("reuse makes no new scaler",2,g_fx_present.made);
+        // DM_FX_INPLACE and DM_FX_DIRECT: the scaler reads a private window texture in place and writes a canvas it can write, while the frame that draws that texture is
+        // still running on the queue (committed just before, as a present follows its frame). The scaler must still see the whole frame: the encoder before it orders it after
+        // the queue's earlier work only around work of its own (an encoder of barriers alone ordered nothing, and the scaler read the frame before, in every round)
+        {
+            const int S=256,ROUNDS=8;
+            MTLTextureDescriptor *wd=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:S height:S mipmapped:NO];
+            wd.storageMode=MTLStorageModePrivate;wd.usage=MTLTextureUsageShaderRead|MTLTextureUsageShaderWrite;id<MTLTexture> win=[g_dev newTextureWithDescriptor:wd];
+            MTLTextureDescriptor *cd=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:2*S height:2*S mipmapped:NO];
+            cd.storageMode=MTLStorageModePrivate;cd.usage=MTLTextureUsageRenderTarget|MTLTextureUsageShaderRead|MTLTextureUsageShaderWrite;id<MTLTexture> canvas=[g_dev newTextureWithDescriptor:cd];
+            id<MTLBuffer> args=[g_dev newBufferWithLength:16 options:MTLResourceStorageModeShared],rb=[g_dev newBufferWithLength:4*S*S*4 options:MTLResourceStorageModeShared];
+            res_add(win);res_add(canvas);res_add(args);res_commit();
+            NSError *err=nil;id<MTL4Compiler> comp=[g_dev newCompilerWithDescriptor:[MTL4CompilerDescriptor new] error:&err];
+            id<MTLLibrary> lib=[g_dev newLibraryWithSource:@"#include <metal_stdlib>\nusing namespace metal;\nstruct A { uint iters; uint tag; };\n"
+                "kernel void frame(constant A &a [[buffer(0)]], texture2d<float, access::write> t [[texture(0)]], uint2 i [[thread_position_in_grid]]) {\n"
+                "  float x = float(i.x); for (uint k = 0; k < a.iters; k++) x = fma(x, 1.0000001f, 0.5f); float g = x > -1.0f ? float(a.tag) / 255.0f : 0.0f; t.write(float4(g, g, g, 1), i); }\n" options:nil error:&err];
+            MTL4LibraryFunctionDescriptor *fd=[MTL4LibraryFunctionDescriptor new];fd.name=@"frame";fd.library=lib;
+            MTL4ComputePipelineDescriptor *pd=[MTL4ComputePipelineDescriptor new];pd.computeFunctionDescriptor=fd;
+            id<MTLComputePipelineState> ps=lib&&comp?[comp newComputePipelineStateWithDescriptor:pd compilerTaskOptions:nil error:&err]:nil;
+            EXPECT("the slow frame kernel compiles",1,ps!=nil);
+            MTL4ArgumentTableDescriptor *ad=[MTL4ArgumentTableDescriptor new];ad.maxBufferBindCount=1;ad.maxTextureBindCount=1;
+            id<MTL4ArgumentTable> at=[g_dev newArgumentTableWithDescriptor:ad error:&err];
+            id<MTL4CommandAllocator> fal=[g_dev newCommandAllocator],pal=[g_dev newCommandAllocator];id<MTLSharedEvent> ev=[g_dev newSharedEvent];
+            g_present_n=1000;int stale=0,kinds=0;
+            for (int round=1;ps&&round<=ROUNDS;round++) {
+                uint32_t tag=40+round*23;((uint32_t *)args.contents)[0]=50000;((uint32_t *)args.contents)[1]=tag;
+                [at setAddress:args.gpuAddress atIndex:0];[at setTexture:win.gpuResourceID atIndex:0];[fal reset];[pal reset];
+                id<MTL4CommandBuffer> fcb=[g_dev newCommandBuffer];[fcb beginCommandBufferWithAllocator:fal];
+                id<MTL4ComputeCommandEncoder> ce=[fcb computeCommandEncoder];[ce setComputePipelineState:ps];[ce setArgumentTable:at];
+                [ce dispatchThreads:MTLSizeMake(S,S,1) threadsPerThreadgroup:MTLSizeMake(16,16,1)];[ce endEncoding];[fcb endCommandBuffer];
+                id<MTL4CommandBuffer> pcb=[g_dev newCommandBuffer];[pcb beginCommandBufferWithAllocator:pal];
+                kinds+=present_encode_m4(pcb,win,canvas,NULL,g_present_uv[0],&g_fx_present)==PRESENT_METALFX;[pcb endCommandBuffer];
+                [g_q4 commit:&fcb count:1];[g_q4 commit:&pcb count:1];[g_q4 signalEvent:ev value:round];
+                if (![ev waitUntilSignaledValue:round timeoutMS:10000]) { EXPECT("in-place present completes",1,0); break; }
+                id<MTLCommandBuffer> cb=[g_q commandBuffer];id<MTLBlitCommandEncoder> bl=[cb blitCommandEncoder];
+                [bl copyFromTexture:canvas sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(2*S,2*S,1) toBuffer:rb destinationOffset:0 destinationBytesPerRow:2*S*4 destinationBytesPerImage:4*S*S*4];
+                [bl endEncoding];[cb commit];[cb waitUntilCompleted];
+                const uint8_t *o=rb.contents;int bad=0;
+                for (int y=4;y<2*S-4;y+=9) for (int x=4;x<2*S-4;x+=9) bad+=abs(o[4*(y*2*S+x)+1]-(int)tag)>3;
+                stale+=bad!=0;
+            }
+            EXPECT("in-place presents go through MetalFX",ROUNDS,kinds);
+            EXPECT("the scaler read the window texture in place: no input copy made",1,g_fx_present.in==nil&&g_fx_present.in_place_n>=ROUNDS);
+            EXPECT("the scaler wrote the canvas: no present pass, no output texture made",1,g_fx_present.out==nil&&g_fx_present.direct_n>=ROUNDS);
+            EXPECT("the scaler saw the whole frame still drawing at the present, rounds stale",0,stale);
+            res_remove(win);res_remove(canvas);res_remove(args);
+        }
         g_present_n=savedPresent;
 
         // Whole-window capture uses the same upscale and remains asynchronous; its completion includes the final BGRA readback.

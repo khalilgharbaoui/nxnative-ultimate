@@ -21,10 +21,16 @@
 //   (13) a damaged file in the cloud: no save to lose, this device's replaces it and the file is kept in the backups ("cloud")
 //   (14) no front end asks: both changed, the newer one wins at the start (the cloud's: it comes in, this one is kept); the cloud not read at the start and this
 //        device's save newer: not sent that session, the next start sends it and keeps the cloud's in the backups ("cloud")
+//   (15) the report a front end reads before it plays; a pull's journal the start cannot put back stops the save mount
+//   (16) a copy of the save at each start ("start"), sync on or off: one when the save changed since the newest copy, none when it did not or there is no save;
+//        the oldest beyond 10 go, sync's backups and the player's folders stay; a backups folder that cannot be written does not stop the game; with sync on,
+//        the copy is the save the game starts from (the cloud's when it came in), and sync's own backups are made as before; after a pull that did not finish,
+//        the copy is this device's save put back, and a save the mount refuses (a journal that cannot be put back or read) is not copied
 #include "../hle_fs.c"
 #include <ctype.h>
 #include <sys/wait.h>
 #include <sys/time.h>
+#include <sys/sysctl.h>
 
 struct dm_flags g_flag; uint64_t g_t0_ns;
 uint64_t now_ns(void) { return clock_gettime_nsec_np(CLOCK_MONOTONIC); }
@@ -99,6 +105,14 @@ static int backups(const char *save, const char *side) {   // how many backups o
     char dir[1200]; snprintf(dir, sizeof dir, "%s-backups", save);
     int k = 0; DIR *d = opendir(dir); struct dirent *e; size_t sl = strlen(side);
     while (d && (e = readdir(d))) { size_t l = strlen(e->d_name); k += l > sl && e->d_name[l - sl - 1] == ' ' && !strcmp(e->d_name + l - sl, side); }
+    if (d) closedir(d);
+    return k;
+}
+
+static int start_copies(const char *save) {   // the start copies: "<date> start", or "<date> start <k>" when two came in one second
+    char dir[1200]; snprintf(dir, sizeof dir, "%s-backups", save);
+    int k = 0; DIR *d = opendir(dir); struct dirent *e;
+    while (d && (e = readdir(d))) { size_t l = strlen(e->d_name); k += l >= 25 && !strncmp(e->d_name + 19, " start", 6) && (l == 25 || e->d_name[25] == ' '); }
     if (d) closedir(d);
     return k;
 }
@@ -183,7 +197,7 @@ int main(void) {
     snprintf(p, sizeof p, "%s.sync-tmp", A); CHECK(!exists(p), "nothing is left beside the save");
     snprintf(p, sizeof p, "%s/game.dat", B);
     CHECK(session(B, cloud, NULL, NULL) == 0 && same(p, "v1"), "the iPhone's first session brings it in");
-    snprintf(q, sizeof q, "%s-backups", B); CHECK(!exists(q), "with no save of its own, the iPhone keeps no backup");
+    CHECK(!backups(B, "local"), "with no save of its own, the iPhone keeps no backup of it");
     CHECK(session(B, cloud, "game.dat", "v2") == 0 && cloud_has(cf, root, "game.dat", "v2"), "the iPhone saves: the cloud has its save");
 
     printf("(4) the cloud's changed\n");
@@ -214,6 +228,10 @@ int main(void) {
     CHECK(session(B, cloud, "game.dat", "v7b") == 0 && cloud_has(cf, root, "game.dat", "v7b"), "the iPhone saves again");
     CHECK(run(A, cloud, NULL, NULL, old_choice, NULL, READABLE) == NOT_SENT && same(p, "v6") && cloud_has(cf, root, "game.dat", "v7b"),
           "a choice made on the cloud's save before that one replaces nothing");
+    {   ss_meta here; char own[64] = "";   // the token names the cloud's save, not this device's (the launchers sent local:<this device's hash> until this was checked)
+        if (!ss_scan(A, &here)) snprintf(own, sizeof own, "local:%s", here.hash);
+        CHECK(*own && run(A, cloud, NULL, NULL, own, NULL, READABLE) == NOT_SENT && same(p, "v6") && cloud_has(cf, root, "game.dat", "v7b"),
+              "local:<this device's hash> is not a choice for the cloud's save: nothing is replaced"); }
     CHECK(run(A, cloud, NULL, NULL, choice_of("local", cf), NULL, READABLE) == 0 && same(p, "v6") && cloud_has(cf, root, "game.dat", "v6"),
           "the player chooses this one: it goes out");
     backup_of(A, "cloud", back, sizeof back); snprintf(q, sizeof q, "%s/save/game.dat", back);
@@ -339,8 +357,18 @@ int main(void) {
     set_mtime(p, time(NULL) - 100);
     CHECK(session(R1, cloud4, "game.dat", "r3-more-progress") == 0 && cloud_has(cf4, root, "game.dat", "r3-more-progress"), "then the Mac saves more and sends it");
     snprintf(p, sizeof p, "%s/game.dat", R2); put(p, "new"); set_mtime(p, time(NULL) + 45);
-    CHECK(REPORT(R2, cloud4) && strstr(line, "conflict=1") && strstr(line, "cfiles=1 ") && strstr(line, "cdevice=Mac"),
+    // the cloud's save was sent from this machine, so its device is this machine's model, as save_sync.c names it: a GitHub runner, a virtual machine, is "VirtualMac2,1"
+    char model[64] = "", want[96]; size_t mlen = sizeof model;
+    if (sysctlbyname("hw.model", model, &mlen, NULL, 0) || !model[0]) snprintf(model, sizeof model, "unknown");
+    snprintf(want, sizeof want, "cdevice=%s ", model);
+    CHECK(REPORT(R2, cloud4) && strstr(line, "conflict=1") && strstr(line, "cfiles=1 ") && strstr(line, want),
           "both changed: the report says conflict, with the cloud's device (%s)", line);
+    CHECK(strstr(line, " pull=0") != NULL, "no pull pending (%s)", line);
+    {   // a pull that did not finish: what is in place may be half the cloud's, so no comparison is offered; the start's mount puts this device's save back first
+        char J[1300]; snprintf(J, sizeof J, "%s.pull", R2); put(J, "kept\t\nfolder\t0\t1\t0\t0\nfolder\t1\t0\t0\t0\n");
+        CHECK(REPORT(R2, cloud4) && strstr(line, " pull=1") && strstr(line, "conflict=0"), "a pending pull: said so, and no conflict offered (%s)", line);
+        unlink(J);
+    }
     {   // the incident of the PR: the new game's save is the newer by date, so the player needs the sizes to tell them apart
         char *cs = strstr(line, "csaved="), *sv = strstr(line, " saved=");
         CHECK(cs && sv && atoll(sv + 7) > atoll(cs + 7) && strstr(line, " size=3 ") && strstr(line, "csize=16 "),
@@ -359,6 +387,103 @@ int main(void) {
     snprintf(q, sizeof q, "%s.sync-tmp", R2);
     CHECK(access(q, F_OK), "the reports leave no files behind");
 #undef REPORT
+
+    {   // (15) a pull's journal the start cannot put back (this device's folder is neither in place nor in the backups it names): the game's save mount stops rather than
+        // play on, commit and send a half-replaced save; the save and the journal are left as they were. With the journal gone, the mount goes on
+        char S15[1200], J[1300], A[1300]; snprintf(S15, sizeof S15, "%s/s15/save", root); mkd(S15);
+        snprintf(A, sizeof A, "%s/a", S15); put(A, "mine");
+        snprintf(J, sizeof J, "%s.pull", S15); put(J, "kept\t/nonexistent/backup\nfolder\t0\t2\t1\t1\nfolder\t1\t0\t0\t0\n");
+        CHECK(session(S15, NULL, NULL, NULL) != 0, "(15) the save mount stops");
+        CHECK(same(A, "mine") && exists(J), "(15) the save and the journal are left as they were");
+        unlink(J);
+        CHECK(session(S15, NULL, NULL, NULL) == 0 && same(A, "mine"), "(15) with no journal the mount goes on");
+    }
+
+    printf("(16) a save folder that cannot be read is not an empty one\n");
+    {   char U[1200], UD[1300], cloud5[1200], cf5[1400], into[1300];
+        snprintf(U, sizeof U, "%s/mac7/save", root); snprintf(UD, sizeof UD, "%s_device", U);
+        snprintf(cloud5, sizeof cloud5, "%s/iCloud Drive/Fifth Saves", root); snprintf(cf5, sizeof cf5, "%s/%s/save.dmsync", cloud5, id);
+        mkd(U); mkd(UD); mkd(cloud5);
+        snprintf(p, sizeof p, "%s/game.dat", U); put(p, "a1"); snprintf(q, sizeof q, "%s/dev.dat", UD); put(q, "d1");
+        static int peek;   // the cloud's device save, unpacked into a folder of its own
+#define CLOUD_DEVICE(value) (snprintf(into, sizeof into, "%s/peek16-%d", root, peek++), mkd(into), !ss_read(cf5, into, &m) && \
+                             (snprintf(q, sizeof q, "%s/save_device/dev.dat", into), same(q, value)))
+        CHECK(session(U, cloud5, NULL, NULL) == 0 && cloud_has(cf5, root, "game.dat", "a1") && CLOUD_DEVICE("d1"), "the Mac sends both saves, the game's and the device's");
+        put(p, "a2"); chmod(UD, 0);
+        setenv("DM_SAVE_SYNC", cloud5, 1);
+        CHECK(save_sync_after_exit(U, DM_GAME_ID) == 0, "the game's save changed and the device save cannot be read: the launcher does not send");
+        CHECK(cloud_has(cf5, root, "game.dat", "a1") && CLOUD_DEVICE("d1"), "the cloud keeps both, the device save included");
+        CHECK(session(U, cloud5, NULL, NULL) == 0 && cloud_has(cf5, root, "game.dat", "a1") && CLOUD_DEVICE("d1"), "a start does not send either (sync is off for that session)");
+        chmod(UD, 0755);
+        CHECK(save_sync_after_exit(U, DM_GAME_ID) == 1 && cloud_has(cf5, root, "game.dat", "a2") && CLOUD_DEVICE("d1"), "readable again: both go out");
+        unsetenv("DM_SAVE_SYNC");
+#undef CLOUD_DEVICE
+    }
+
+    printf("(17) a copy of the save at each start\n");
+    char S[1200], E[1200], W[1200], cloud6[1200];
+    snprintf(S, sizeof S, "%s/mac12/save", root); snprintf(E, sizeof E, "%s/mac13/save", root); snprintf(W, sizeof W, "%s/mac14/save", root);
+    snprintf(cloud6, sizeof cloud6, "%s/iCloud Drive/Sixth Saves", root); mkd(S); mkd(E); mkd(W); mkd(cloud6);
+    snprintf(p, sizeof p, "%s/game.dat", S); put(p, "s1"); snprintf(p, sizeof p, "%s_device", S); mkd(p); snprintf(p, sizeof p, "%s_device/dev.dat", S); put(p, "d1");
+    CHECK(session(S, NULL, NULL, NULL) == 0 && start_copies(S) == 1, "a start with a save and sync off makes one copy (%d)", start_copies(S));
+    backup_of(S, "start", back, sizeof back); snprintf(q, sizeof q, "%s/save/game.dat", back); snprintf(u, sizeof u, "%s/save_device/dev.dat", back);
+    CHECK(*back && same(q, "s1") && same(u, "d1"), "it holds the save and the device save as they were at the start (%s)", back);
+    sleep(1);
+    CHECK(session(S, NULL, "game.dat", "s2") == 0 && start_copies(S) == 1, "the next start, the save unchanged: no copy, though the game then saves (%d)", start_copies(S));
+    sleep(1);
+    CHECK(session(S, NULL, NULL, NULL) == 0 && start_copies(S) == 2, "the start after it, the save changed: one more (%d)", start_copies(S));
+    backup_of(S, "start", back, sizeof back); snprintf(q, sizeof q, "%s/save/game.dat", back);
+    CHECK(*back && same(q, "s2"), "the newest holds what the game saved (%s)", back);
+    snprintf(p, sizeof p, "%s/game.dat", S); CHECK(same(p, "s2"), "the save itself is untouched");
+    CHECK(session(E, NULL, NULL, NULL) == 0, "a first start with no save");
+    snprintf(q, sizeof q, "%s-backups", E); CHECK(!exists(q), "makes no copy");
+    snprintf(q, sizeof q, "%s-backups", S);
+    for (int i = 0; i < 12; i++) { snprintf(p, sizeof p, "%s/2001-01-01 00.00.%02d start/save", q, i); mkd(p); }
+    snprintf(p, sizeof p, "%s/2001-01-01 00.00.00 local", q); mkd(p); snprintf(p, sizeof p, "%s/2001-01-01 00.00.00 cloud", q); mkd(p); snprintf(p, sizeof p, "%s/my copy", q); mkd(p);
+    snprintf(p, sizeof p, "%s/game.dat", S); put(p, "s3"); sleep(1);
+    CHECK(session(S, NULL, NULL, NULL) == 0 && start_copies(S) == 10, "with 14 start copies already there, a new one leaves the newest 10 (%d)", start_copies(S));
+    snprintf(p, sizeof p, "%s/2001-01-01 00.00.04 start", q); snprintf(u, sizeof u, "%s/2001-01-01 00.00.05 start", q);
+    CHECK(!exists(p) && exists(u), "the five oldest went (00 to 04)");
+    snprintf(p, sizeof p, "%s/2001-01-01 00.00.00 local", q); snprintf(u, sizeof u, "%s/2001-01-01 00.00.00 cloud", q); char u3[1400]; snprintf(u3, sizeof u3, "%s/my copy", q);
+    CHECK(exists(p) && exists(u) && exists(u3), "sync's backups and a folder of the player's stay");
+    snprintf(p, sizeof p, "%s/game.dat", W); put(p, "w1");
+    snprintf(q, sizeof q, "%s-backups", W); mkd(q); chmod(q, 0555);
+    CHECK(session(W, NULL, "game.dat", "w2") == 0 && start_copies(W) == 0, "a backups folder that cannot be written: no copy, and the game still mounts, saves and commits");
+    chmod(q, 0755);
+    snprintf(p, sizeof p, "%s/game.dat", W); CHECK(same(p, "w2"), "what it saved is in the save");
+    snprintf(p, sizeof p, "%s/game.dat", W); put(p, "w3");
+    CHECK(session(W, cloud6, NULL, NULL) == 0 && session(E, cloud6, NULL, NULL) == 0, "with sync on, one device sends w3 and another brings it in");
+    snprintf(p, sizeof p, "%s/game.dat", E);
+    backup_of(E, "start", back, sizeof back); snprintf(q, sizeof q, "%s/save/game.dat", back);
+    CHECK(same(p, "w3") && *back && same(q, "w3") && !backups(E, "local"), "the start copy is the save the game starts from, the cloud's (%s)", back);
+    snprintf(p, sizeof p, "%s/game.dat", W); put(p, "w4"); snprintf(p, sizeof p, "%s/game.dat", E); put(p, "e1"); set_mtime(p, time(NULL) - 100);
+    sleep(1);
+    CHECK(session(W, cloud6, NULL, NULL) == 0 && session(E, cloud6, NULL, NULL) == 0, "both change; the newer, from the other device, comes in");
+    backup_of(E, "local", back, sizeof back); snprintf(q, sizeof q, "%s/save/game.dat", back);
+    snprintf(u, sizeof u, "%s/game.dat", E);
+    CHECK(same(u, "w4") && *back && same(q, "e1"), "sync still keeps this device's own save as a local backup (%s)", back);
+    backup_of(E, "start", back, sizeof back); snprintf(q, sizeof q, "%s/save/game.dat", back);
+    CHECK(*back && same(q, "w4") && start_copies(E) == 2, "and the start copy holds the save it brought in (%d)", start_copies(E));
+    {   // a pull cut short after its swap (the cloud's folder in place, this device's in the backups): the next start puts this device's save back, then copies it
+        char P[1200], K[1300], KS[1400], J[1300]; struct stat st;
+        snprintf(P, sizeof P, "%s/mac15/save", root); mkd(P); snprintf(p, sizeof p, "%s/game.dat", P); put(p, "cloud");
+        snprintf(K, sizeof K, "%s-backups/2001-01-01 00.00.00 local", P); snprintf(KS, sizeof KS, "%s/save", K); mkd(KS);
+        snprintf(p, sizeof p, "%s/game.dat", KS); put(p, "mine"); stat(KS, &st);
+        snprintf(J, sizeof J, "%s.pull", P); FILE *jf = fopen(J, "w");
+        fprintf(jf, "kept\t%s\nfolder\t0\t2\t%llu\t%llu\nfolder\t1\t0\t0\t0\n", K, (unsigned long long)st.st_dev, (unsigned long long)st.st_ino); fclose(jf);
+        CHECK(session(P, NULL, NULL, NULL) == 0 && !exists(J), "a pull cut short: the next start puts this device's save back and mounts it");
+        snprintf(p, sizeof p, "%s/game.dat", P); backup_of(P, "start", back, sizeof back); snprintf(q, sizeof q, "%s/save/game.dat", back);
+        CHECK(same(p, "mine") && *back && same(q, "mine") && start_copies(P) == 1, "the start copy is this device's save put back, not the cloud's half (%s)", back);
+    }
+    {   // a save the mount refuses is not copied: a journal the start cannot put back, then one that cannot be read; with it gone, the mount goes on and copies
+        char P[1200], J[1300]; snprintf(P, sizeof P, "%s/mac16/save", root); mkd(P); snprintf(p, sizeof p, "%s/game.dat", P); put(p, "half");
+        snprintf(J, sizeof J, "%s.pull", P); put(J, "kept\t/nonexistent/backup\nfolder\t0\t2\t1\t1\nfolder\t1\t0\t0\t0\n");
+        CHECK(session(P, NULL, NULL, NULL) != 0 && start_copies(P) == 0, "a journal that cannot be put back: the mount stops, and no start copy (%d)", start_copies(P));
+        put(J, "not a journal\n");
+        CHECK(session(P, NULL, NULL, NULL) != 0 && start_copies(P) == 0, "a journal that cannot be read: the same (%d)", start_copies(P));
+        unlink(J);
+        CHECK(session(P, NULL, NULL, NULL) == 0 && start_copies(P) == 1, "with no journal the mount goes on and copies the save (%d)", start_copies(P));
+    }
 
     printf("== save sync: %d checks, %d failed ==\n", checks, fails);
     if (!fails) { char c[1200]; snprintf(c, sizeof c, "rm -rf '%s'", root); system(c); }

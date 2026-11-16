@@ -71,6 +71,12 @@ import Foundation
         expect(String(cString: getenv("DM_FULLSCREEN")) == "1" && d.string(forKey: "launcher.DM_FULLSCREEN") == "1", "Fullscreen goes into the environment and is saved")
         mm.values["DM_FULLSCREEN"] = "0"; mm.apply()
         expect(String(cString: getenv("DM_FULLSCREEN")) == "0" && d.string(forKey: "launcher.DM_FULLSCREEN") == nil, "Window is the default: set to 0, not saved")
+        unsetenv("DM_MOTION")
+        expect(mm.rows(in: "Controls").contains { $0.env == "DM_MOTION" } && mm.values["DM_MOTION"] == "1", "Motion controls is in Controls, on by default")
+        mm.values["DM_MOTION"] = "0"; mm.apply()
+        expect(getenv("DM_MOTION").map { String(cString: $0) } == "0" && d.string(forKey: "launcher.DM_MOTION") == "0", "Motion controls off goes into the environment as DM_MOTION=0 and is saved")
+        mm.values["DM_MOTION"] = "1"; mm.apply()
+        expect(getenv("DM_MOTION").map { String(cString: $0) } == "1" && d.string(forKey: "launcher.DM_MOTION") == nil, "on is the default: set to 1, not saved")
         let macScale = mac.settings.first { $0.env == "DM_RENDER_SCALE" }!
         mm.values["DM_OPMODE"] = "1"
         expect(mm.rangeLabel(macScale, 1) == "1600 × 900 (100 %)" && mm.rangeLabel(macScale, 0.5) == "800 × 450 (50 %)", "docked size in pixels at 1.0 and 0.5")
@@ -86,7 +92,14 @@ import Foundation
         launched.reset(); launched.apply()
         expect(launched.values["DM_OPMODE"] == "0" && d.string(forKey: "launcher.DM_OPMODE") == "1", "Reset then Play keeps the saved choice of a setting fixed at launch")
         unsetenv("DM_OPMODE"); setenv("DM_ENV_LAUNCH_KEYS", "", 1); d.removeObject(forKey: "launcher.DM_OPMODE")
+        // The cloud-save dialog's answers name the cloud's save (save_sync.c read_choice), whichever side the player keeps
+        let lh = String(repeating: "a", count: 32), ch = String(repeating: "b", count: 32)
+        let both = SaveSyncReport(line: "sync=1 cloud=1 local=\(lh) saved=1 files=1 size=1 chash=\(ch) csaved=2 cfiles=1 csize=1 cdevice=iPhone17,1 sametitle=1 conflict=1 pull=0")!
+        expect(SaveSyncReport.step(both) == .choose && both.localChoice == "local:" + ch && both.cloudChoice == "cloud:" + ch, "both changed: local:<cloud's hash> and cloud:<cloud's hash>")
+        let none = SaveSyncReport(line: "sync=1 cloud=0 local=\(lh) saved=1 files=1 size=1 chash=- csaved=0 cfiles=0 csize=0 cdevice=- sametitle=1 conflict=0 pull=0")!
+        expect(none.localChoice == "local:none", "no cloud save: local:none")
         failed += checkLauncherLayout(LauncherModel(mac.settings, defaults: d), defaults: d)
+        failed += checkLauncherPad()
         print("launcher storage: \(failed) failed")
         exit(failed == 0 ? 0 : 1)
     }

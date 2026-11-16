@@ -96,8 +96,6 @@ SHADER_BINDING = [
 # Profile switches: (key, the start of its value ('' = any), entry). A key is per-game data, so `game`; its goal is `host` where it is the semantics every game should get
 DEFAULT_SOON = 'a default for every game after `regress.py check` on the games'
 SWITCH_BINDING = [
-    ('render_cond', '', {'what': 'NVN conditional rendering', 'now': 'game', 'goal': 'host', 'purpose': 'rendering',
-     'why': f'what the GPU does; off by default only because other games drew everything before: {DEFAULT_SOON}'}),
     ('draw_barriers', '', {'what': 'draw passes ordered by the game\'s own barriers', 'now': 'game', 'goal': 'host', 'purpose': 'frame rate', 'why': f'what NVN specifies: {DEFAULT_SOON}'}),
     ('mem_map_limit', '', {'what': 'MapPhysicalMemory limited to the application pool', 'now': 'game', 'goal': 'host', 'purpose': 'memory',
      'why': "Horizon's limit; off by default because Ace Attorney Investigations Collection maps a little more than its profile's 1 GB pool, which is the thing to fix"}),
@@ -140,6 +138,7 @@ SWITCH_BINDING = [
     ('jit_route', '', {'what': 'a route for the nn::jit capture', 'now': 'game', 'goal': 'game', 'purpose': 'runtime', 'why': "the game's own menus, for the image an iPhone serves"}),
     ('jit_out_code', '', {'what': 'where a nn::jit output lists the code it made', 'now': 'game', 'goal': 'game', 'purpose': 'runtime', 'why': "the layout of the game's own output buffer, for the image an iPhone serves"}),
     ('op_mode', '', {'what': 'the operation mode at start', 'now': 'game', 'goal': 'game', 'purpose': 'runtime', 'why': "the game's controls (handheld: the touch screen instead of a gyro pointer)"}),
+    ('audio_limit', '', {'what': 'a limiter on the final audio mix', 'now': 'game', 'goal': 'game', 'purpose': 'runtime', 'why': 'an enhancement: the Switch clips a mix over int16 as the host does, so a game that mixes with no headroom chooses it'}),
 ]
 
 
@@ -175,18 +174,19 @@ def build_rows(gs):   # {build ID: [(game, display version, module)]}
     return out
 
 
-OTHER_BASE = 0x8000000   # where the dry run puts a MATCH_FRAME_STEP rule's other functions, 16 MB apart, so their sites read as offsets in them; its patch area starts at 0x6000000,
-                          # within a b's reach (128 MB) of a main's sites below it and of up to six other functions above
+OTHER_STEP = 0x200000
+OTHER_BASE = 0x8000000   # where the dry run puts a MATCH_FRAME_STEP rule's other functions, 2 MB apart, so their sites read as offsets in them; its patch area starts at 0x6000000,
+                          # within a b's reach (128 MB) of a main's sites below it and of up to forty-eight other functions above
 
 
 def frame_step_sites(fn, base=0, others=(), found=None):   # (offset, reason) of each site a FRAME_STEP function (or a MATCH_FRAME_STEP stub, its function at base) writes, whether it marks a
     pos, puts = [0x6000000], []                    # render-scale stub, the sites in each of the rule's other functions ({label: [(offset, reason)]}) and the capabilities it declares
     def emit(w): pos[0] += 4
-    at = {label: OTHER_BASE + i * 0x1000000 for i, label in enumerate(others)}
-    ctx = types.SimpleNamespace(here=lambda: pos[0], emit=emit, site=lambda off, orig: None, put=lambda off, words, why: puts.append((off, why)), state=0x9000000, render_scale=0, base=base,
+    at = {label: OTHER_BASE + i * OTHER_STEP for i, label in enumerate(others)}
+    ctx = types.SimpleNamespace(here=lambda: pos[0], emit=emit, site=lambda off, orig: None, put=lambda off, words, why: puts.append((off, why)), state=0x9000000, render_scale=0, step_max=0, base=base,
                                 others=at, found=found, capabilities=set(), address=lambda off: 0)
     fn(ctx)
-    in_others = {label: sorted((off - a, why) for off, why in puts if a <= off < a + 0x1000000) for label, a in at.items()}
+    in_others = {label: sorted((off - a, why) for off, why in puts if a <= off < a + OTHER_STEP) for label, a in at.items()}
     return sorted((off, why) for off, why in puts if off < OTHER_BASE), ctx.render_scale, in_others, sorted(ctx.capabilities)
 
 

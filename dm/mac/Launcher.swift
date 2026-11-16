@@ -3,8 +3,9 @@
 // and so is the store: launcher.<VAR> in the app's preferences, which launcher.c reads when the window is not shown (docs/frontends.md, Saved choices). Basic settings (level basic) come
 // first, the others under Advanced settings, each in the list's sections. Play puts the settings into this process's environment, which the host inherits; Quit and closing the window end the
 // app without the game. "Show this window at launch" off: no window unless Option is held at launch, and launcher.c applies the saved choices. The window never takes focus by itself: an app
-// opened in the background (open -g) keeps its window behind until the player switches to it
+// opened in the background (open -g) keeps its window behind until the player switches to it. A controller's A is Play and its B is Quit (LauncherPad)
 import AppKit
+import GameController
 import QuartzCore
 import SwiftUI
 
@@ -117,6 +118,44 @@ enum SaveCheck {
     }
 }
 
+/// Play and Quit from a game controller: GameController's buttonA is Play and buttonB is Quit on any controller, as the host's own prompts take them (front_mac.m
+/// hq_buttons, cp_buttons). A button counts on its release, after a press the window took: the button is up again before the host starts, so the press that started
+/// the game reaches it neither as a button nor as a join (DM_PAD_PRESS_TO_JOIN). A button already down when the window starts taking input (held at launch, or through
+/// an alert) counts only from its next press. An alert, a panel or an open menu takes no button: A never picks a save (SaveCheck.ask has no default on purpose).
+/// Controllers the host reads outside GameController (raw HID pads, Switch 2 controllers) are not seen here
+struct LauncherPad {
+    enum Action { case play, quit }
+    private struct Click {
+        var ready = false, down = false   // seen up while taking input; pressed after that
+        mutating func step(_ pressed: Bool, live: Bool) -> Bool {
+            guard live else { self = Click(); return false }
+            if pressed { down = down || ready; return false }
+            defer { self = Click(ready: true, down: false) }
+            return down
+        }
+    }
+    private var a = Click(), b = Click()
+
+    /// window: the settings window is key with no alert, panel or menu open (takesInput); playEnabled: as the Play button
+    mutating func step(a pressedA: Bool, b pressedB: Bool, window: Bool, playEnabled: Bool) -> Action? {
+        let play = a.step(pressedA, live: window && playEnabled), quit = b.step(pressedB, live: window)
+        return play ? .play : quit ? .quit : nil
+    }
+
+    static let tick = Timer.publish(every: 1.0 / 60, on: .main, in: .common).autoconnect()   // common modes: it samples during an alert's modal loop and a menu's tracking too, which reset a press
+
+    static var takesInput: Bool {
+        guard let w = NSApp.keyWindow else { return false }   // macOS delivers no controller input to an app that is not frontmost (shouldMonitorBackgroundEvents off)
+        return NSApp.modalWindow == nil && w.attachedSheet == nil && RunLoop.current.currentMode != .eventTracking
+    }
+
+    static func buttons() -> (a: Bool, b: Bool) {
+        var a = false, b = false
+        for c in GCController.controllers() { if let g = c.extendedGamepad { a = a || g.buttonA.isPressed; b = b || g.buttonB.isPressed } }
+        return (a, b)
+    }
+}
+
 struct LauncherView: View {
     @ObservedObject var m: LauncherModel
     let done: (Bool) -> Void
@@ -125,6 +164,7 @@ struct LauncherView: View {
     @AppStorage("window.advanced") private var advanced = false
     @State private var checking = false
     @State private var check = 0   // which Play the running check is for: one the player went on from without it is dropped
+    @State private var pad = LauncherPad()
 
     var body: some View {
         VStack(spacing: 0) {
@@ -132,25 +172,38 @@ struct LauncherView: View {
                 Image(nsImage: NSApp.applicationIconImage).resizable().frame(width: 64, height: 64).accessibilityHidden(true)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(info("CFBundleName") ?? "Game").font(.title2.weight(.semibold))
-                    Text("Version \(info("CFBundleShortVersionString") ?? "1.0")").foregroundStyle(.secondary)
+                    Text(version).foregroundStyle(.secondary).textSelection(.enabled)
                 }
                 Spacer()
             }
-            .padding([.horizontal, .top], 20)
+            .padding(.horizontal, 20).padding(.top, 8)
             Form {
                 settingSections(basic: true)
                 CloudSavesSection()
                 Section {
-                    DisclosureGroup("Advanced settings", isExpanded: $advanced) {}
-                }
-                if advanced {
-                    settingSections(basic: false)
-                    Section {
-                        Button("Reset to tested defaults") { m.reset() }
-                            .disabled(!m.changed)
-                    } footer: {
-                        Text("Brings back all settings this game was tested with.")
+                    DisclosureGroup("Advanced settings", isExpanded: $advanced) {
+                        ForEach(m.sections(basic: false), id: \.self) { section in
+                            let rows = m.rows(in: section, basic: false)
+                            if !rows.isEmpty {
+                                Text(section).font(.subheadline.weight(.semibold)).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading)
+                                ForEach(rows) { SettingRow(s: $0, m: m) }
+                            }
+                        }
+                        VStack(alignment: .leading, spacing: 4) {
+                            Button("Reset to tested defaults") { m.reset() }
+                                .disabled(!m.changed)
+                            Text("Brings back all settings this game was tested with.").font(.caption).foregroundStyle(.secondary)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
                     }
+                }
+                Section {
+                    Button("Export Save Data…") { exportSave() }
+                    Button("Import Save Data…") { importSave() }
+                } header: {
+                    Text("Save data")
+                } footer: {
+                    Text("Export keeps a copy of the game's last save as a file. Import replaces this game's save with one; the replaced save is kept beside it.")
                 }
             }
             .formStyle(.grouped)
@@ -173,6 +226,16 @@ struct LauncherView: View {
             .padding(20)
         }
         .frame(minWidth: 520, idealWidth: 560)
+        .onReceive(LauncherPad.tick) { _ in padStep() }
+    }
+
+    private func padStep() {
+        let live = LauncherPad.takesInput, buttons = live ? LauncherPad.buttons() : (a: false, b: false)
+        switch pad.step(a: buttons.a, b: buttons.b, window: live, playEnabled: !checking) {
+        case .play: fputs("launcher: Play from a controller (A)\n", stderr); start()
+        case .quit: fputs("launcher: Quit from a controller (B)\n", stderr); done(false)
+        case nil: break
+        }
     }
 
     /// Play, once the cloud's save is compared with this Mac's: a save that changed on both sides is the player's pick, not the newer file's (SaveCheck)
@@ -193,6 +256,12 @@ struct LauncherView: View {
         }
     }
 
+    /// The app's version and the commit that packed it (DMCommit), which a bug report needs
+    private var version: String {
+        let v = "Version \(info("CFBundleShortVersionString") ?? "1.0")"
+        return info("DMCommit").map { "\(v) (\($0))" } ?? v
+    }
+
     @ViewBuilder private func settingSections(basic: Bool) -> some View {
         ForEach(m.sections(basic: basic), id: \.self) { section in
             let rows = m.rows(in: section, basic: basic)
@@ -202,6 +271,36 @@ struct LauncherView: View {
                 }
             }
         }
+    }
+
+    // The save panel starts where a player looks for a file; the archive is written there (SaveData.export)
+    private func exportSave() {
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [SaveData.contentType]
+        panel.nameFieldStringValue = SaveData.suggestedFileName()
+        panel.directoryURL = try? SaveData.defaultExportURL().deletingLastPathComponent()
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do { try SaveData.export(to: url); alert("Save data", "Exported to \(url.path)") }
+        catch { alert("Save data", error.localizedDescription, style: .warning) }
+    }
+
+    private func importSave() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [SaveData.contentType]
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do { try SaveData.importArchive(from: url); alert("Save data", "Imported. The game starts with it.") }
+        catch { alert("Save data", error.localizedDescription, style: .warning) }
+    }
+
+    private func alert(_ title: String, _ text: String, style: NSAlert.Style = .informational) {
+        let a = NSAlert()
+        a.messageText = title
+        a.informativeText = text
+        a.alertStyle = style
+        a.addButton(withTitle: "OK")
+        a.runModal()
     }
 }
 
@@ -265,6 +364,7 @@ private final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate 
         item.submenu = app; menu.addItem(item); NSApp.mainMenu = menu
         let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 560, height: 660), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
         w.title = name; w.isReleasedWhenClosed = false; w.delegate = self
+        w.titleVisibility = .hidden; w.titlebarAppearsTransparent = true   // the header below names the game; the Dock and Mission Control still read the title
         w.contentMinSize = NSSize(width: 520, height: 0)
         window = w
         if let screen = w.screen ?? NSScreen.main {
